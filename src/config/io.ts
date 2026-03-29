@@ -412,22 +412,88 @@ function unsetPathForWrite(
   return { changed: false, next: root };
 }
 
+/**
+ * 解析配置快照的哈希值
+ * 
+ * **解析逻辑**:
+ * 1. 优先使用 `snapshot.hash`（如果存在且非空）
+ * 2. 否则从 `snapshot.raw` 重新计算 SHA-256 哈希
+ * 3. 两者都无效则返回 null
+ * 
+ * **用途**:
+ * - 配置完整性校验
+ * - 检测配置是否被修改
+ * - 审计日志记录
+ * 
+ * @param snapshot - 配置快照对象
+ * @param snapshot.hash - 预计算的哈希值（可选）
+ * @param snapshot.raw - 原始配置 JSON 字符串（可选）
+ * @returns 配置哈希字符串或 null
+ * 
+ * @example
+ * ```typescript
+ * // 场景 1: 使用预计算的哈希
+ * const snapshot1 = {
+ *   hash: 'abc123...',
+ *   raw: '{"gateway": {"port": 18789}}'
+ * };
+ * resolveConfigSnapshotHash(snapshot1);
+ * // → 'abc123...' (直接使用预计算哈希)
+ * 
+ * // 场景 2: 从 raw 重新计算哈希
+ * const snapshot2 = {
+ *   raw: JSON.stringify({ gateway: { port: 18789 } })
+ * };
+ * resolveConfigSnapshotHash(snapshot2);
+ * // → 'sha256-hash-of-raw-string'
+ * 
+ * // 场景 3: 空哈希字符串降级到 raw
+ * const snapshot3 = {
+ *   hash: '   ',  // 空白字符串
+ *   raw: '{}'
+ * };
+ * resolveConfigSnapshotHash(snapshot3);
+ * // → 'sha256-hash-of-{}' (忽略空白 hash，从 raw 计算)
+ * 
+ * // 场景 4: 两者都无效
+ * const snapshot4 = {};
+ * resolveConfigSnapshotHash(snapshot4);
+ * // → null
+ * ```
+ */
 export function resolveConfigSnapshotHash(snapshot: {
+  /** 预计算的哈希值（可选） */
   hash?: string;
+  /** 原始配置 JSON 字符串（可选） */
   raw?: string | null;
 }): string | null {
+  // 步骤 1: 尝试使用预计算的哈希值
   if (typeof snapshot.hash === "string") {
     const trimmed = snapshot.hash.trim();
     if (trimmed) {
-      return trimmed;
+      return trimmed;  // 返回非空哈希
     }
   }
+  
+  // 步骤 2: 哈希无效时，从 raw 重新计算
   if (typeof snapshot.raw !== "string") {
-    return null;
+    return null;  // raw 也无效，返回 null
   }
+  
   return hashConfigRaw(snapshot.raw);
 }
 
+/**
+ * 强制转换为配置对象类型
+ * 
+ * **类型检查逻辑**:
+ * 1. 检查是否为有效对象（非 null、非数组）
+ * 2. 是则转换为 OpenClawConfig
+ * 3. 否则返回空对象 {}
+ * 
+ * @param value - 要转换的未知值
+ * @returns 配置对象或空对象
+ */
 function coerceConfig(value: unknown): OpenClawConfig {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return {};
@@ -435,10 +501,30 @@ function coerceConfig(value: unknown): OpenClawConfig {
   return value as OpenClawConfig;
 }
 
+/**
+ * 判断是否为纯对象
+ * 
+ * **检测条件**:
+ * - 类型为 object
+ * - 不为 null
+ * - 不是数组
+ * 
+ * @param value - 要检查的值
+ * @returns 是否为纯对象
+ */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * 检查是否包含配置元数据
+ * 
+ * **检测逻辑**:
+ * 检查对象的 `meta` 属性是否为纯对象
+ * 
+ * @param value - 要检查的值
+ * @returns 是否包含配置元数据
+ */
 function hasConfigMeta(value: unknown): boolean {
   if (!isPlainObject(value)) {
     return false;
@@ -447,6 +533,15 @@ function hasConfigMeta(value: unknown): boolean {
   return isPlainObject(meta);
 }
 
+/**
+ * 解析网关模式
+ * 
+ * **解析逻辑**:
+ * 从配置对象中提取 `gateway.mode` 字段
+ * 
+ * @param value - 配置对象
+ * @returns 网关模式字符串或 null
+ */
 function resolveGatewayMode(value: unknown): string | null {
   if (!isPlainObject(value)) {
     return null;
@@ -1278,35 +1373,116 @@ function maybeLoadDotEnvForConfig(env: NodeJS.ProcessEnv): void {
   loadDotEnv({ quiet: true });
 }
 
+/**
+ * 解析 JSON5 配置原始字符串
+ * 
+ * **解析逻辑**:
+ * 1. 使用 JSON5.parse() 尝试解析
+ * 2. 成功则返回 `{ ok: true, parsed }`
+ * 3. 失败则捕获异常并返回 `{ ok: false, error }`
+ * 
+ * **为什么使用 JSON5**:
+ * - 支持注释（// 和 /*）
+ * - 支持尾随逗号
+ * - 支持无引号键名
+ * - 更适合作为配置文件格式
+ * 
+ * @param raw - 原始 JSON5 字符串
+ * @param json5 - JSON5 解析器对象（默认 JSON5）
+ * @returns 解析结果对象
+ * 
+ * @example
+ * ```typescript
+ * // 场景 1: 成功解析标准 JSON5
+ * const result1 = parseConfigJson5('{"gateway": {"port": 18789}}');
+ * // → { ok: true, parsed: { gateway: { port: 18789 } } }
+ * 
+ * // 场景 2: 成功解析带注释的 JSON5
+ * const result2 = parseConfigJson5(`
+ *   {
+ *     "gateway": {
+ *       "port": 18789  // 网关端口
+ *     }
+ *   }
+ * `);
+ * // → { ok: true, parsed: { gateway: { port: 18789 } } }
+ * 
+ * // 场景 3: 解析失败（语法错误）
+ * const result3 = parseConfigJson5('{"gateway": { port: 18789 }');
+ * // → { ok: false, error: 'SyntaxError: ...' }
+ * 
+ * // 场景 4: 使用自定义解析器
+ * const customJson5 = {
+ *   parse: (str) => JSON.parse(str)  // 使用标准 JSON
+ * };
+ * const result4 = parseConfigJson5('{"key": "value"}', customJson5);
+ * // → { ok: true, parsed: { key: "value" } }
+ * ```
+ */
 export function parseConfigJson5(
+  /** 原始 JSON5 字符串 */
   raw: string,
+  /** JSON5 解析器对象（可选，默认使用全局 JSON5） */
   json5: { parse: (value: string) => unknown } = JSON5,
 ): ParseConfigJson5Result {
   try {
+    // 尝试使用 JSON5 解析
     return { ok: true, parsed: json5.parse(raw) };
   } catch (err) {
+    // 捕获解析异常并返回错误信息
     return { ok: false, error: String(err) };
   }
 }
 
+/** 配置读取解析结果类型 */
 type ConfigReadResolution = {
+  /** 解析后的配置原始对象 */
   resolvedConfigRaw: unknown;
+  /** 用于恢复的环境变量快照 */
   envSnapshotForRestore: Record<string, string | undefined>;
+  /** 环境变量替换警告列表 */
   envWarnings: EnvSubstitutionWarning[];
 };
 
+/** 遗留配置迁移结果类型 */
 type LegacyMigrationResolution = {
+  /** 生效的配置原始对象 */
   effectiveConfigRaw: unknown;
+  /** 源配置中的遗留问题列表 */
   sourceLegacyIssues: LegacyConfigIssue[];
 };
 
+/**
+ * 解析配置中的 include 指令
+ * 
+ * **处理流程**:
+ * 1. 遍历配置中的所有 include 路径
+ * 2. 读取被包含的文件内容
+ * 3. 使用 guards 检查安全性（防止循环引用、路径遍历攻击）
+ * 4. 解析被包含文件的 JSON5 内容
+ * 5. 合并到主配置对象
+ * 
+ * **安全机制**:
+ * - 循环引用检测
+ * - 路径遍历防护
+ * - 文件读取权限检查
+ * 
+ * @param parsed - 已解析的配置对象
+ * @param configPath - 主配置文件路径
+ * @param deps - 依赖注入对象
+ * @param deps.fs - 文件系统接口
+ * @returns 合并后的配置对象
+ */
 function resolveConfigIncludesForRead(
   parsed: unknown,
   configPath: string,
   deps: Required<ConfigIoDeps>,
 ): unknown {
   return resolveConfigIncludes(parsed, configPath, {
+    // 同步读取文件内容
     readFile: (candidate) => deps.fs.readFileSync(candidate, "utf-8"),
+    
+    // 带 guards 的安全读取
     readFileWithGuards: ({ includePath, resolvedPath, rootRealDir }) =>
       readConfigIncludeFileWithGuards({
         includePath,
@@ -1314,41 +1490,104 @@ function resolveConfigIncludesForRead(
         rootRealDir,
         ioFs: deps.fs,
       }),
+    
+    // 使用 JSON5 解析被包含文件
     parseJson: (raw) => deps.json5.parse(raw),
   });
 }
 
+/**
+ * 解析配置的完整读取流程
+ * 
+ * **执行步骤**:
+ * ```text
+ * 1. 应用 config.env 到 process.env
+ *    → 使得 ${VAR} 引用可以访问配置中定义的变量
+ * 
+ * 2. 收集环境变量引用警告
+ *    → 不抛出异常，而是记录警告（避免非关键配置崩溃系统）
+ * 
+ * 3. 解析环境变量替换
+ *    → 将 ${VAR} 占位符替换为实际值
+ * 
+ * 4. 捕获环境变量快照
+ *    → 用于写入时恢复 ${VAR} 引用
+ * ```
+ * 
+ * **设计哲学**:
+ * - 容错性：非关键缺失变量不崩溃，仅记录警告
+ * - 可恢复性：保存环境快照以便后续还原
+ * - 灵活性：允许配置定义环境变量
+ * 
+ * @param resolvedIncludes - 已解析 include 的配置对象
+ * @param env - 环境变量对象
+ * @returns 配置读取解析结果
+ */
 function resolveConfigForRead(
+  /** 包含解析后的配置对象 */
   resolvedIncludes: unknown,
+  /** 环境变量对象 */
   env: NodeJS.ProcessEnv,
 ): ConfigReadResolution {
-  // Apply config.env to process.env BEFORE substitution so ${VAR} can reference config-defined vars.
+  // 步骤 1: 将 config.env 应用到 process.env
+  // 目的：使得 ${VAR} 引用可以访问配置中定义的变量
   if (resolvedIncludes && typeof resolvedIncludes === "object" && "env" in resolvedIncludes) {
     applyConfigEnvVars(resolvedIncludes as OpenClawConfig, env);
   }
 
-  // Collect missing env var references as warnings instead of throwing,
-  // so non-critical config sections with unset vars don't crash the gateway.
+  // 步骤 2: 初始化警告收集器
   const envWarnings: EnvSubstitutionWarning[] = [];
+  
+  // 步骤 3: 执行环境变量替换并收集警告
   return {
     resolvedConfigRaw: resolveConfigEnvVars(resolvedIncludes, env, {
-      onMissing: (w) => envWarnings.push(w),
+      onMissing: (w) => envWarnings.push(w),  // 记录缺失警告
     }),
-    // Capture env snapshot after substitution for write-time ${VAR} restoration.
+    
+    // 步骤 4: 捕获替换后的环境快照（用于写入时恢复）
     envSnapshotForRestore: { ...env } as Record<string, string | undefined>,
+    
+    // 步骤 5: 返回警告列表
     envWarnings,
   };
 }
 
+/**
+ * 解析遗留配置迁移
+ * 
+ * **处理逻辑**:
+ * 1. 检查源配置是否存在遗留问题
+ * 2. 无问题则直接返回原配置
+ * 3. 有问题则执行迁移逻辑
+ * 4. 返回迁移后的配置和问题列表
+ * 
+ * **向后兼容性**:
+ * - 自动检测旧版本配置格式
+ * - 平滑迁移到新格式
+ * - 保留问题记录便于审计
+ * 
+ * @param resolvedConfigRaw - 已解析的配置原始对象
+ * @param sourceRaw - 源配置原始对象
+ * @returns 遗留配置迁移结果
+ */
 function resolveLegacyConfigForRead(
+  /** 已解析的配置原始对象 */
   resolvedConfigRaw: unknown,
+  /** 源配置原始对象 */
   sourceRaw: unknown,
 ): LegacyMigrationResolution {
+  // 步骤 1: 查找源配置中的遗留问题
   const sourceLegacyIssues = findLegacyConfigIssues(resolvedConfigRaw, sourceRaw);
+  
+  // 快速路径：没有遗留问题，直接返回
   if (sourceLegacyIssues.length === 0) {
     return { effectiveConfigRaw: resolvedConfigRaw, sourceLegacyIssues };
   }
+  
+  // 步骤 2: 执行迁移逻辑
   const migrated = migrateLegacyConfig(resolvedConfigRaw);
+  
+  // 步骤 3: 返回迁移后的配置或原配置（如果迁移失败）
   return {
     effectiveConfigRaw: migrated.config ?? resolvedConfigRaw,
     sourceLegacyIssues,
@@ -1360,6 +1599,17 @@ type ReadConfigFileSnapshotInternalResult = {
   envSnapshotForRestore?: Record<string, string | undefined>;
 };
 
+/**
+ * 完成配置快照读取的内部结果处理
+ * 
+ * **处理逻辑**:
+ * 1. 调用 observeConfigSnapshot 观察快照（用于调试和审计）
+ * 2. 返回原始结果对象
+ * 
+ * @param deps - 依赖注入对象
+ * @param result - 读取结果对象
+ * @returns 完成处理后的结果
+ */
 async function finalizeReadConfigSnapshotInternalResult(
   deps: Required<ConfigIoDeps>,
   result: ReadConfigFileSnapshotInternalResult,
@@ -1368,6 +1618,108 @@ async function finalizeReadConfigSnapshotInternalResult(
   return result;
 }
 
+/**
+ * 创建配置 I/O 操作实例（工厂函数） ⭐⭐⭐ 核心中的核心
+ * 
+ * **核心职责**:
+ * - 封装所有配置读写操作
+ * - 管理配置生命周期（加载、验证、保存、热重载）
+ * - 提供配置快照机制
+ * - 处理环境变量替换和 Shell 环境回退
+ * - 自动迁移遗留配置
+ * - 审计日志和健康检查
+ * 
+ * **完整加载流程**（loadConfig 函数）:
+ * ```text
+ * 1. 加载 .env 文件（如果存在）
+ *    → maybeLoadDotEnvForConfig()
+ * 
+ * 2. 检查配置文件是否存在
+ *    ├─ 不存在：尝试 Shell 环境回退（如果启用）
+ *    └─ 存在：继续下一步
+ * 
+ * 3. 读取并解析配置
+ *    ├─ 读取原始内容 → fs.readFileSync()
+ *    ├─ 计算 SHA-256 哈希 → hashConfigRaw()
+ *    ├─ JSON5 解析 → json5.parse()
+ *    └─ 解析 $include 指令 → resolveConfigIncludesForRead()
+ * 
+ * 4. 环境变量替换
+ *    ├─ 应用 config.env 到 process.env
+ *    ├─ 替换 ${VAR} 占位符
+ *    └─ 收集缺失警告（不崩溃）
+ * 
+ * 5. 遗留配置迁移
+ *    ├─ 检测遗留问题 → findLegacyConfigIssues()
+ *    └─ 执行迁移 → migrateLegacyConfig()
+ * 
+ * 6. 验证配置
+ *    ├─ 查找重复 Agent 目录 → findDuplicateAgentDirs()
+ *    ├─ Zod Schema 验证 → validateConfigObjectWithPlugins()
+ *    └─ 失败则抛出 INVALID_CONFIG 错误
+ * 
+ * 7. 应用默认值
+ *    └─ apply*Defaults() 系列函数（按特定顺序）
+ *       → applyMessageDefaults
+ *       → applyLoggingDefaults
+ *       → applySessionDefaults
+ *       → applyAgentDefaults
+ *       → applyContextPruningDefaults
+ *       → applyCompactionDefaults
+ *       → applyModelDefaults
+ *       → applyTalkConfigNormalization
+ * 
+ * 8. 标准化路径和执行安全配置
+ *    ├─ normalizeConfigPaths()
+ *    └─ normalizeExecSafeBinProfilesInConfig()
+ * 
+ * 9. 再次检查重复 Agent 目录（验证后）
+ * 
+ * 10. 应用 Shell 环境回退（如果配置启用）
+ * 
+ * 11. 自动生成 commands.ownerDisplaySecret（如果缺失）
+ *     └─ 异步持久化到配置文件
+ * 
+ * 12. 应用运行时覆盖
+ *     └─ applyConfigOverrides()
+ * 
+ * 13. 返回最终配置对象
+ * ```
+ * 
+ * **设计模式**:
+ * - **工厂模式**: 返回包含多个方法的闭包对象
+ * - **依赖注入**: 通过 ConfigIoDeps 接口注入外部依赖
+ * - **容错设计**: 非关键错误记录警告，不中断启动
+ * - **快速失败**: 关键错误（如验证失败）立即抛出
+ * 
+ * **使用示例**:
+ * ```typescript
+ * // 场景 1: 创建默认配置 I/O 实例
+ * const configIO = createConfigIO();
+ * const config = configIO.loadConfig();
+ * console.log(config.gateway.port);
+ * 
+ * // 场景 2: 自定义依赖注入（测试场景）
+ * const mockDeps: ConfigIoDeps = {
+ *   fs: {
+ *     readFileSync: () => '{"gateway": {"port": 18790}}',
+ *     existsSync: () => true
+ *   },
+ *   logger: { warn: console.warn, error: console.error },
+ *   json5: JSON5
+ * };
+ * const configIO2 = createConfigIO(mockDeps);
+ * 
+ * // 场景 3: 异步读取配置快照
+ * const snapshot = await configIO.readConfigFileSnapshot();
+ * console.log(snapshot.config);
+ * console.log(snapshot.hash);  // SHA-256 校验和
+ * console.log(snapshot.warnings);  // 配置警告列表
+ * ```
+ * 
+ * @param overrides - 依赖注入覆盖（可选）
+ * @returns 配置 I/O 操作实例（包含 loadConfig, readConfigFileSnapshot 等方法）
+ */
 export function createConfigIO(overrides: ConfigIoDeps = {}) {
   const deps = normalizeDeps(overrides);
   const requestedConfigPath = resolveConfigPathForDeps(deps);

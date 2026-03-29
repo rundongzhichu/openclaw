@@ -1,3 +1,69 @@
+/**
+ * @fileoverview CLI Secret Gateway 命令实现
+ * 
+ * 本文件实现了 OpenClaw 系统中密钥解析的 CLI 命令，负责：
+ * - 分析和解析命令相关的密钥分配
+ * - 与 Gateway 协作完成远程密钥解析
+ * - 支持多种解析模式（强制执行、只读状态、只读操作）
+ * - 处理 Web 工具运行时密钥特殊逻辑
+ * - 提供详细的诊断信息和目标状态报告
+ * 
+ * **核心功能**:
+ * - 密钥分配分析（analyzeCommandSecretAssignmentsFromSnapshot）
+ * - 本地解析（resolveSecretRefValue）
+ * - 远程解析（callGateway 调用 Gateway API）
+ * - 配置修改（setPathExistingStrict）
+ * - 诊断输出（dedupeDiagnostics）
+ * 
+ * **解析模式**:
+ * 1. **enforce_resolved** (strict): 强制执行所有密钥必须解析成功，否则抛出错误
+ * 2. **read_only_status** (summary): 只读模式，仅报告状态，不修改配置
+ * 3. **read_only_operational** (operational_readonly): 只读操作模式，允许部分未解析
+ * 
+ * **密钥目标类型**:
+ * - `resolved_gateway`: 通过 Gateway 远程解析
+ * - `resolved_local`: 本地直接解析
+ * - `inactive_surface`: 非活跃认证表面（被忽略）
+ * - `unresolved`: 未解析（缺少必要的环境变量或配置）
+ * 
+ * **Web 工具特殊处理**:
+ * - 检测是否 targeting Web runtime（tools.web.* 路径）
+ * - 跳过某些 Web 工具的本地解析
+ * - 依赖 Gateway 动态加载
+ * 
+ * **使用示例**:
+ * ```typescript
+ * // 场景 1: 强制执行模式（默认）
+ * const result = await resolveCommandSecretsViaGateway({
+ *   mode: "enforce_resolved",
+ *   config: loadedConfig,
+ *   commandName: "deploy",
+ *   targetIds: new Set(["tools.web.search.apiKey"])
+ * });
+ * console.log(result.resolvedConfig);  // 包含解析后的完整配置
+ * console.log(result.diagnostics);     // 诊断信息
+ * 
+ * // 场景 2: 只读状态检查
+ * const status = await resolveCommandSecretsViaGateway({
+ *   mode: "read_only_status",
+ *   config: currentConfig,
+ *   commandName: "status",
+ *   targetIds: new Set(["tools.web.search.apiKey"])
+ * });
+ * console.log(status.targetStatesByPath);  // 查看所有密钥目标状态
+ * 
+ * // 场景 3: 操作只读模式（允许部分未解析）
+ * const operational = await resolveCommandSecretsViaGateway({
+ *   mode: "read_only_operational",
+ *   config: config,
+ *   commandName: "run",
+ *   targetIds: new Set(["tools.web.search.apiKey"])
+ * });
+ * ```
+ * 
+ * @module cli/command-secret-gateway
+ */
+
 import type { OpenClawConfig } from "../config/config.js";
 import { resolveSecretInputRef } from "../config/types.secrets.js";
 import { callGateway } from "../gateway/call.js";
