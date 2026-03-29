@@ -1,4 +1,35 @@
 #!/usr/bin/env node
+/**
+ * @fileoverview OpenClaw 主入口文件
+ * 
+ * 这是 OpenClaw CLI 的启动入口，负责：
+ * - 环境变量标准化和初始化
+ * - 编译缓存启用 (Node.js v22+ 特性)
+ * - 进程标题设置
+ * - CLI respawn 逻辑 (用于版本切换/容器化场景)
+ * - 子进程桥接
+ * - 参数解析和命令路由
+ * 
+ * **执行流程**:
+ * 1. 检查是否为主模块 (防止重复执行)
+ * 2. 安装 Gaxios fetch 兼容性补丁
+ * 3. 设置进程标题为 "openclaw"
+ * 4. 标准化环境变量
+ * 5. 启用编译缓存
+ * 6. 处理 profile 参数
+ * 7. 解析容器目标
+ * 8. 构建 respawn 计划
+ * 9. 启动 CLI 命令处理
+ * 
+ * **特殊处理**:
+ * - Windows 参数标准化
+ * - secrets audit 命令的只读 auth store
+ * - --help 和 --version 的快速路径
+ * - 容器化环境检测
+ * 
+ * @module entry
+ */
+
 import { spawn } from "node:child_process";
 import { enableCompileCache } from "node:module";
 import process from "node:process";
@@ -14,11 +45,21 @@ import { ensureOpenClawExecMarkerOnProcess } from "./infra/openclaw-exec-env.js"
 import { installProcessWarningFilter } from "./infra/warning-filter.js";
 import { attachChildProcessBridge } from "./process/child-process-bridge.js";
 
+/**
+ * 入口包装器对列表
+ * 用于检测当前运行的是 wrapper 还是实际入口文件
+ */
 const ENTRY_WRAPPER_PAIRS = [
   { wrapperBasename: "openclaw.mjs", entryBasename: "entry.js" },
   { wrapperBasename: "openclaw.js", entryBasename: "entry.js" },
 ] as const;
 
+/**
+ * 检查是否需要强制只读 auth store
+ * 当执行 `openclaw secrets audit` 命令时启用
+ * @param argv - 命令行参数数组
+ * @returns 如果应该启用只读模式返回 true
+ */
 function shouldForceReadOnlyAuthStore(argv: string[]): boolean {
   const tokens = argv.slice(2).filter((token) => token.length > 0 && !token.startsWith("-"));
   for (let index = 0; index < tokens.length - 1; index += 1) {
@@ -29,18 +70,18 @@ function shouldForceReadOnlyAuthStore(argv: string[]): boolean {
   return false;
 }
 
-// Guard: only run entry-point logic when this file is the main module.
-// The bundler may import entry.js as a shared dependency when dist/index.js
-// is the actual entry point; without this guard the top-level code below
-// would call runCli a second time, starting a duplicate gateway that fails
-// on the lock / port and crashes the process.
+// 守卫：仅当此文件是主模块时才运行入口点逻辑。
+// 打包工具可能会将 entry.js 作为共享依赖导入，
+// 当 dist/index.js 是实际的入口点时；
+// 如果没有这个守卫，runCli 会被第二次调用，
+// 导致启动一个重复的 gateway，在锁/端口上失败并使进程崩溃。
 if (
   !isMainModule({
     currentFile: fileURLToPath(import.meta.url),
     wrapperEntryPairs: [...ENTRY_WRAPPER_PAIRS],
   })
 ) {
-  // Imported as a dependency — skip all entry-point side effects.
+  // 作为依赖被导入 — 跳过所有入口点副作用。
 } else {
   const { installGaxiosFetchCompat } = await import("./infra/gaxios-fetch-compat.js");
 

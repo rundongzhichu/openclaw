@@ -1,3 +1,23 @@
+/**
+ * @fileoverview Agent 命令执行模块
+ * 
+ * 本文件实现了 `openclaw agent` CLI 命令的核心逻辑，负责：
+ * - 解析用户输入的消息和参数
+ * - 准备 Agent 执行上下文 (会话、工作空间、超时等)
+ * - 调用 Gateway RPC 执行 Agent
+ * - 处理流式响应输出
+ * - 管理 ACP (Agent Control Plane) 会话
+ * - 支持子代理孵化 (spawn subagent)
+ * - 处理思考级别 (thinking level) 和详细程度 (verbose)
+ * 
+ * 主要函数:
+ * - {@link agentCommand} - Agent 命令入口函数
+ * - {@link prepareAgentCommandExecution} - 准备执行上下文
+ * - {@link agentCommandInternal} - 内部执行逻辑
+ * 
+ * @module agents/agent-command
+ */
+
 import { getAcpSessionManager } from "../acp/control-plane/manager.js";
 import { resolveAcpAgentPolicyError, resolveAcpDispatchPolicyError } from "../acp/policy.js";
 import { toAcpRuntimeError } from "../acp/runtime/errors.js";
@@ -116,19 +136,72 @@ const OVERRIDE_FIELDS_CLEARED_BY_DELETE: OverrideFieldClearedByDelete[] = [
 
 const OVERRIDE_VALUE_MAX_LENGTH = 256;
 
+/**
+ * 持久化会话条目到磁盘
+ * 
+ * 将会话状态保存到文件系统，支持会话恢复和跨进程共享。
+ * 使用 `persistSessionEntryBase` 底层函数，自动清理被删除的覆盖字段。
+ * 
+ * **数据一致性**: 通过 `clearedFields` 确保删除某些配置时，
+ * 对应的派生字段也被同步清理，防止脏数据残留。
+ * 
+ * @param params - 持久化参数
+ * @param params.sessionStore - 会话存储对象（内存中的映射表）
+ * @param params.sessionKey - 会话键（唯一标识符）
+ * @param params.storePath - 存储文件路径
+ * @param params.entry - 要保存的会话条目
+ * 
+ * @example
+ * // 使用示例
+ * await persistSessionEntry({
+ *   sessionStore: store,
+ *   sessionKey: "agent:main:session123",
+ *   storePath: "~/.openclaw/sessions/main.json",
+ *   entry: {
+ *     createdAt: Date.now(),
+ *     lastActivityAt: Date.now(),
+ *     messageCount: 42,
+ *     // ... 其他字段
+ *   }
+ * });
+ */
 async function persistSessionEntry(params: PersistSessionEntryParams): Promise<void> {
+  // 调用底层持久化函数，传入预定义的清理字段列表
   await persistSessionEntryBase({
     ...params,
+    // 这些字段在删除时会被自动清空，保持数据一致性
     clearedFields: OVERRIDE_FIELDS_CLEARED_BY_DELETE,
   });
 }
 
+/**
+ * 检查字符串是否包含控制字符
+ * 
+ * 控制字符（ASCII 0x00-0x1F 和 0x7F-0x9F）在用户输入中通常是不合法的，
+ * 可能导致终端显示异常或安全问题。此函数用于输入验证。
+ * 
+ * **Unicode 处理技巧**: 使用 `codePointAt(0)` 而非 `charCodeAt(0)`，
+ * 因为前者支持完整的 Unicode 码点（包括代理对），后者只能处理 BMP 平面。
+ * 
+ * @param value - 要检查的字符串
+ * @returns 如果包含控制字符返回 true，否则返回 false
+ * 
+ * @example
+ * containsControlCharacters("hello")     // false
+ * containsControlCharacters("hello\u0000") // true (包含 NULL)
+ * containsControlCharacters("test\u001b")  // true (包含 ESC)
+ */
 function containsControlCharacters(value: string): boolean {
+  // 遍历每个字符（支持 Unicode 代理对）
   for (const char of value) {
     const code = char.codePointAt(0);
     if (code === undefined) {
-      continue;
+      continue;  // 跳过无效字符
     }
+    
+    // 检查是否在控制字符范围内：
+    // 0x00-0x1F: C0 控制字符（NULL, SOH, STX, ..., US）
+    // 0x7F-0x9F: C1 控制字符（DEL, DCS, XON, XOFF, ...）
     if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) {
       return true;
     }
@@ -136,52 +209,167 @@ function containsControlCharacters(value: string): boolean {
   return false;
 }
 
+/**
+ * 规范化显式覆盖输入
+ * 
+ * 对用户提供的 provider/model 覆盖参数进行严格验证和规范化：
+ * 1. 去除首尾空白
+ * 2. 检查非空
+ * 3. 检查长度限制（防止过长输入）
+ * 4. 检查控制字符（防止注入攻击）
+ * 
+ * **安全最佳实践**: 所有外部输入都应经过类似的严格验证
+ * 
+ * @param raw - 原始输入字符串
+ * @param kind - 覆盖类型（"provider" 或 "model"）
+ * @returns 规范化后的字符串
+ * 
+ * @throws Error 当输入无效时抛出具体错误信息
+ * 
+ * @example
+ * // 正常情况
+ * normalizeExplicitOverrideInput("  gpt-4  ", "model")  
+ * // 返回："gpt-4"
+ * 
+ * // 异常情况
+ * normalizeExplicitOverrideInput("", "provider")  
+ * // 抛出："Provider override must be non-empty."
+ * 
+ * normalizeExplicitOverrideInput("a".repeat(300), "model")  
+ * // 抛出："Model override exceeds 256 characters."
+ */
 function normalizeExplicitOverrideInput(raw: string, kind: "provider" | "model"): string {
+  // 步骤 1: 去除空白
   const trimmed = raw.trim();
   const label = kind === "provider" ? "Provider" : "Model";
+  
+  // 步骤 2: 检查非空
   if (!trimmed) {
     throw new Error(`${label} override must be non-empty.`);
   }
+  
+  // 步骤 3: 检查长度（防御 DoS 攻击）
   if (trimmed.length > OVERRIDE_VALUE_MAX_LENGTH) {
     throw new Error(`${label} override exceeds ${String(OVERRIDE_VALUE_MAX_LENGTH)} characters.`);
   }
+  
+  // 步骤 4: 检查控制字符（防御注入攻击）
   if (containsControlCharacters(trimmed)) {
     throw new Error(`${label} override contains invalid control characters.`);
   }
+  
+  // 返回验证通过的干净输入
   return trimmed;
 }
 
+/**
+ * 准备 Agent 命令执行上下文
+ * 
+ * 这是 `openclaw agent` 命令的核心预处理函数，负责：
+ * 1. 验证输入参数（消息、会话选择器）
+ * 2. 加载并解析配置（包括 secret 引用）
+ * 3. 规范化派生元数据（spawnedBy, groupId 等）
+ * 4. 验证 agent ID 覆盖
+ * 5. 解析模型和推理级别配置
+ * 6. 处理 verbose 级别
+ * 7. 计算超时时间
+ * 8. 确定会话键和工作空间
+ * 
+ * **返回值模式**: 返回一个包含所有必要上下文的对象，
+ * 避免后续函数需要传递大量参数。
+ * 
+ * @param opts - Agent 命令选项
+ * @param opts.message - 用户消息
+ * @param opts.to - 目标 E.164 号码
+ * @param opts.sessionId - 会话 ID
+ * @param opts.sessionKey - 完整会话键
+ * @param opts.agentId - Agent ID 覆盖
+ * @param opts.thinking - 推理级别
+ * @param opts.verbose - 详细程度
+ * @param opts.spawnedBy - 派生源元数据
+ * @param opts.senderIsOwner - 发送者是否为所有者
+ * @param runtime - 运行时环境（提供日志等功能）
+ * 
+ * @returns 准备好的执行上下文，包含：
+ * - body: 处理后的消息体
+ * - cfg: 解析后的配置对象
+ * - sessionKey: 确定的会话键
+ * - workspaceDir: 工作空间路径
+ * - timeoutMs: 超时毫秒数
+ * - 等等...
+ * 
+ * @throws Error 当参数无效时抛出具体错误
+ * 
+ * @example
+ * // 使用示例
+ * const ctx = await prepareAgentCommandExecution({
+ *   message: "Hello, analyze this repo",
+ *   agentId: "main",
+ *   thinking: "high",
+ *   senderIsOwner: true,
+ * }, defaultRuntime);
+ * 
+ * // ctx.body - 包含内部事件上下文的消息
+ * // ctx.cfg - 完整的运行时配置
+ * // ctx.sessionKey - "agent:main:session-xxx"
+ * // ctx.workspaceDir - "/Users/xxx/.openclaw/agents/main"
+ * // ctx.timeoutMs - 300000 (5 分钟)
+ */
 async function prepareAgentCommandExecution(
   opts: AgentCommandOpts & { senderIsOwner: boolean },
   runtime: RuntimeEnv,
 ) {
+  // ========== 阶段 1: 基础参数验证 ==========
+  
+  // 提取并验证消息
   const message = opts.message ?? "";
   if (!message.trim()) {
     throw new Error("Message (--message) is required");
   }
+  
+  // 前置内部事件上下文到消息体（用于追踪消息来源）
   const body = prependInternalEventContext(message, opts.internalEvents);
+  
+  // 验证会话选择器（至少提供一个）
   if (!opts.to && !opts.sessionId && !opts.sessionKey && !opts.agentId) {
     throw new Error("Pass --to <E.164>, --session-id, or --agent to choose a session");
   }
 
+  // ========== 阶段 2: 加载配置 ==========
+  
+  // 首先尝试从磁盘读取最新配置（写操作需要最新快照）
   const loadedRaw = loadConfig();
   const sourceConfig = await (async () => {
     try {
       const { snapshot } = await readConfigFileSnapshotForWrite();
       if (snapshot.valid) {
-        return snapshot.resolved;
+        return snapshot.resolved;  // 返回已解析的配置文件
       }
     } catch {
-      // Fall back to runtime-loaded config when source snapshot is unavailable.
+      // 当无法获取源快照时，回退到运行时加载的配置
+      // 这种降级策略确保命令在非关键情况下仍能继续
     }
     return loadedRaw;
   })();
+  
+  // 解析 secret 引用（通过网关 RPC 从密钥管理工具获取真实值）
   const { resolvedConfig: cfg, diagnostics } = await resolveCommandSecretRefsViaGateway({
     config: loadedRaw,
-    commandName: "agent",
-    targetIds: getAgentRuntimeCommandSecretTargetIds(),
+    commandName: "agent",  // 用于选择正确的 secret 分配规则
+    targetIds: getAgentRuntimeCommandSecretTargetIds(),  // 目标 secret ID 列表
   });
+  
+  // 设置运行时配置快照（全局状态）
   setRuntimeConfigSnapshot(cfg, sourceConfig);
+  
+  // 记录 secret 解析诊断信息
+  for (const entry of diagnostics) {
+    runtime.log(`[secrets] ${entry}`);
+  }
+
+  // ========== 阶段 3: 规范化派生元数据 ==========
+  
+  // 规范化 spawnedBy 相关字段（支持多种来源格式）
   const normalizedSpawned = normalizeSpawnedRunMetadata({
     spawnedBy: opts.spawnedBy,
     groupId: opts.groupId,
@@ -189,12 +377,15 @@ async function prepareAgentCommandExecution(
     groupSpace: opts.groupSpace,
     workspaceDir: opts.workspaceDir,
   });
-  for (const entry of diagnostics) {
-    runtime.log(`[secrets] ${entry}`);
-  }
+
+  // ========== 阶段 4: 验证 Agent ID 覆盖 ==========
+  
+  // 规范化 agent ID（去除空白、转小写）
   const agentIdOverrideRaw = opts.agentId?.trim();
   const agentIdOverride = agentIdOverrideRaw ? normalizeAgentId(agentIdOverrideRaw) : undefined;
+  
   if (agentIdOverride) {
+    // 检查 agent ID 是否存在于配置中
     const knownAgents = listAgentIds(cfg);
     if (!knownAgents.includes(agentIdOverride)) {
       throw new Error(
@@ -202,6 +393,8 @@ async function prepareAgentCommandExecution(
       );
     }
   }
+  
+  // 检查 agent ID 与会话键的一致性（防止误用）
   if (agentIdOverride && opts.sessionKey) {
     const sessionAgentId = resolveAgentIdFromSessionKey(opts.sessionKey);
     if (sessionAgentId !== agentIdOverride) {
@@ -210,16 +403,27 @@ async function prepareAgentCommandExecution(
       );
     }
   }
+
+  // ========== 阶段 5: 解析模型和推理配置 ==========
+  
+  // 获取默认 agent 配置
   const agentCfg = cfg.agents?.defaults;
+  
+  // 解析配置的模型引用（考虑 fallback 链）
   const configuredModel = resolveConfiguredModelRef({
     cfg,
     defaultProvider: DEFAULT_PROVIDER,
     defaultModel: DEFAULT_MODEL,
   });
+  
+  // 生成推理级别提示信息（用于错误提示）
   const thinkingLevelsHint = formatThinkingLevels(configuredModel.provider, configuredModel.model);
 
+  // 规范化推理级别参数
   const thinkOverride = normalizeThinkLevel(opts.thinking);
   const thinkOnce = normalizeThinkLevel(opts.thinkingOnce);
+  
+  // 验证推理级别有效性
   if (opts.thinking && !thinkOverride) {
     throw new Error(`Invalid thinking level. Use one of: ${thinkingLevelsHint}.`);
   }
@@ -227,11 +431,15 @@ async function prepareAgentCommandExecution(
     throw new Error(`Invalid one-shot thinking level. Use one of: ${thinkingLevelsHint}.`);
   }
 
+  // ========== 阶段 6: 处理 verbose 级别 ==========
+  
   const verboseOverride = normalizeVerboseLevel(opts.verbose);
   if (opts.verbose && !verboseOverride) {
     throw new Error('Invalid verbose level. Use "on", "full", or "off".');
   }
 
+  // ========== 阶段 7: 计算超时时间 ==========
+  
   const laneRaw = typeof opts.lane === "string" ? opts.lane.trim() : "";
   const isSubagentLane = laneRaw === String(AGENT_LANE_SUBAGENT);
   const timeoutSecondsRaw =
@@ -251,6 +459,8 @@ async function prepareAgentCommandExecution(
     overrideSeconds: timeoutSecondsRaw,
   });
 
+  // ========== 阶段 8: 确定会话键和工作空间 ==========
+  
   const sessionResolution = resolveSession({
     cfg,
     to: opts.to,

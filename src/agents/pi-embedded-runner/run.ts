@@ -1,3 +1,36 @@
+/**
+ * @fileoverview 嵌入式 Agent 运行器
+ * 
+ * 本文件实现了 OpenClaw 的嵌入式 Agent 执行引擎，是整个系统的核心运行时。
+ * 主要功能包括：
+ * 
+ * - **Agent 执行**: 运行 Pi Agent (基于 @mariozechner/pi-agent-core)
+ * - **流式传输**: 支持 block streaming 和 tool call streaming
+ * - **上下文管理**: 自动 compaction 以适配模型 context window
+ * - **工具集成**: 创建 OpenClaw 专用工具集 (browser, canvas, nodes 等)
+ * - **故障转移**: 支持多模型/多 Provider 自动 failover
+ * - **Hook 系统**: 在 Agent 生命周期各个阶段触发插件 Hook
+ * - **认证管理**: OAuth/API Key 认证 profile 管理
+ * - **使用量追踪**: 记录 token 使用情况和成本
+ * 
+ * 核心函数:
+ * - {@link runEmbeddedPiAgent} - 主入口，运行嵌入式 Pi Agent
+ * - {@link runEmbeddedAttempt} - 单次执行尝试 (不含 failover)
+ * - {@link createOpenClawTools} - 创建工具集
+ * 
+ * 执行流程:
+ * 1. 解析工作空间 (支持 fallback 逻辑)
+ * 2. 加载运行时插件
+ * 3. 解析模型配置和认证 profile
+ * 4. 触发 before_agent_start Hook
+ * 5. 运行 Pi Agent 执行
+ * 6. 处理结果 (流式输出/工具调用)
+ * 7. 触发 after_model_respond Hook
+ * 8. 返回执行结果
+ * 
+ * @module agents/pi-embedded-runner/run
+ */
+
 import { randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import type { ThinkLevel } from "../../auto-reply/thinking.js";
@@ -303,7 +336,7 @@ export async function runEmbeddedPiAgent(
       let overflowCompactionAttempts = 0;
       let toolResultTruncationAttempted = false;
       let bootstrapPromptWarningSignaturesSeen =
-        params.bootstrapPromptWarningSignaturesSeen ??
+        params.bootstrapPromptWarningSignatures ??
         (params.bootstrapPromptWarningSignature ? [params.bootstrapPromptWarningSignature] : []);
       const usageAccumulator = createUsageAccumulator();
       let lastRunPromptUsage: ReturnType<typeof normalizeUsage> | undefined;

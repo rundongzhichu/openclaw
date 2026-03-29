@@ -1,3 +1,20 @@
+/**
+ * @fileoverview OpenClaw 网关服务器核心实现
+ * 
+ * 本文件实现了 OpenClaw 系统的核心控制平面 - Gateway 服务器。
+ * Gateway 是整个系统的大脑，负责：
+ * - WebSocket RPC 通信处理
+ * - HTTP 服务 (Control UI, WebChat)
+ * - 通道管理 (WhatsApp, Telegram, Slack 等 20+ 种渠道)
+ * - 会话管理 (Session)
+ * - Agent 运行时协调
+ * - 插件系统引导
+ * - Cron 定时任务
+ * - Tailscale 网络暴露
+ * 
+ * @module gateway/server
+ */
+
 import path from "node:path";
 import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { getActiveEmbeddedRunCount } from "../agents/pi-embedded-runner/runs.js";
@@ -47,7 +64,7 @@ import {
   setSkillsRemoteRegistry,
 } from "../infra/skills-remote.js";
 import { enqueueSystemEvent } from "../infra/system-events.js";
-import { scheduleGatewayUpdateCheck } from "../infra/update-startup.js";
+import { scheduleGatewayUpdate检查 } from "../infra/update-startup.js";
 import { startDiagnosticHeartbeat, stopDiagnosticHeartbeat } from "../logging/diagnostic.js";
 import { createSubsystemLogger, runtimeForLogger } from "../logging/subsystem.js";
 import { resolveConfiguredDeferredChannelPluginIds } from "../plugins/channel-plugin-ids.js";
@@ -182,82 +199,231 @@ const canvasRuntime = runtimeForLogger(logCanvas);
 
 type AuthRateLimitConfig = Parameters<typeof createAuthRateLimiter>[0];
 
+/**
+ * 创建网关认证速率限制器
+ * 
+ * 根据配置创建两种速率限制器：
+ * 1. **标准限制器**: 遵循配置的豁免策略（如 loopback 豁免）
+ * 2. **浏览器限制器**: 强制不豁免 loopback，用于限制来自浏览器的 WebSocket 认证尝试
+ * 
+ * @param rateLimitConfig - 认证速率限制配置
+ * @returns 包含两个限制器的对象
+ * 
+ * @example
+ * // 使用示例
+ * const limiters = createGatewayAuthRateLimiters({
+ *   mode: "token",
+ *   maxAttempts: 5,
+ *   windowMs: 60000,
+ *   exemptLoopback: true  // 标准限制器会豁免本地回环
+ * });
+ * 
+ * // limiters.rateLimiter - 标准限制器（可能豁免 loopback）
+ * // limiters.browserRateLimiter - 浏览器限制器（绝不豁免 loopback）
+ */
 function createGatewayAuthRateLimiters(rateLimitConfig: AuthRateLimitConfig | undefined): {
   rateLimiter?: AuthRateLimiter;
   browserRateLimiter: AuthRateLimiter;
 } {
+  // 如果提供了配置，创建标准速率限制器；否则保持未定义
   const rateLimiter = rateLimitConfig ? createAuthRateLimiter(rateLimitConfig) : undefined;
-  // Browser-origin WS auth attempts always use loopback-non-exempt throttling.
+  
+  // 浏览器来源的 WebSocket 认证尝试始终使用非豁免的 loopback 限制
+  // 这是为了防止浏览器端的暴力破解攻击，即使是本地请求也要限流
   const browserRateLimiter = createAuthRateLimiter({
     ...rateLimitConfig,
-    exemptLoopback: false,
+    exemptLoopback: false,  // 强制禁用 loopback 豁免
   });
+  
   return { rateLimiter, browserRateLimiter };
 }
 
+/**
+ * 记录网关认证表面诊断信息
+ * 
+ * 分析并记录所有认证相关配置的状态（active/inactive），
+ * 帮助开发者了解哪些认证方式已激活，哪些被忽略。
+ * 
+ * **执行逻辑**:
+ * 1. 评估所有认证表面的状态（基于配置、默认值、环境变量）
+ * 2. 收集 inactive 的 secret 引用警告
+ * 3. 遍历所有认证表面路径，检查其激活状态
+ * 4. 记录详细日志，包括 inactive 原因
+ * 
+ * @param prepared - 预处理的配置和警告信息
+ * 
+ * @example
+ * // 日志输出示例：
+ * // [SECRETS_GATEWAY_AUTH_SURFACE] gateway.auth.token is active. Using env OPENCLAW_TOKEN
+ * // [SECRETS_GATEWAY_AUTH_SURFACE] gateway.auth.password is inactive. Ignored because token is active
+ */
 function logGatewayAuthSurfaceDiagnostics(prepared: {
   sourceConfig: OpenClawConfig;
   warnings: Array<{ code: string; path: string; message: string }>;
 }): void {
+  // 步骤 1: 评估所有认证表面的状态
   const states = evaluateGatewayAuthSurfaceStates({
     config: prepared.sourceConfig,
     defaults: prepared.sourceConfig.secrets?.defaults,
-    env: process.env,
+    env: process.env,  // 检查环境变量覆盖
   });
+  
+  // 步骤 2: 构建 inactive 警告映射表
   const inactiveWarnings = new Map<string, string>();
   for (const warning of prepared.warnings) {
     if (warning.code !== "SECRETS_REF_IGNORED_INACTIVE_SURFACE") {
-      continue;
+      continue;  // 只关注 inactive surface 的警告
     }
     inactiveWarnings.set(warning.path, warning.message);
   }
+  
+  // 步骤 3: 遍历所有认证表面路径，记录状态
   for (const path of GATEWAY_AUTH_SURFACE_PATHS) {
     const state = states[path];
     if (!state.hasSecretRef) {
-      continue;
+      continue;  // 没有 secret 引用，跳过
     }
+    
+    // 标记激活状态
     const stateLabel = state.active ? "active" : "inactive";
+    
+    // 优先使用 inactive 警告详情，否则使用状态原因
     const inactiveDetails =
       !state.active && inactiveWarnings.get(path) ? inactiveWarnings.get(path) : undefined;
     const details = inactiveDetails ?? state.reason;
+    
+    // 步骤 4: 输出诊断日志
     logSecrets.info(`[SECRETS_GATEWAY_AUTH_SURFACE] ${path} is ${stateLabel}. ${details}`);
   }
 }
 
+/**
+ * 应用网关认证覆盖以进行启动前检查
+ * 
+ * 在启动 auth 持久化任何东西之前，快速失败（fail-fast）检查必需的 secret 引用是否已解析。
+ * 通过合并用户提供的覆盖配置来准备启动前的配置快照。
+ * 
+ * **类型安全技巧**: 使用 `Pick<T, K>` 工具类型仅提取需要的字段，避免传递整个大对象
+ * 
+ * @param config - 当前配置对象
+ * @param overrides - 认证和 Tailscale 覆盖配置
+ * @returns 合并后的新配置对象（不可变模式）
+ * 
+ * @example
+ * // 使用示例
+ * const preflightConfig = applyGatewayAuthOverridesForStartupPreflight(
+ *   runtimeConfig,
+ *   {
+ *     auth: { mode: "token", token: "override-token" },
+ *     tailscale: { mode: "serve" }
+ *   }
+ * );
+ */
 function applyGatewayAuthOverridesForStartupPreflight(
   config: OpenClawConfig,
   overrides: Pick<GatewayServerOptions, "auth" | "tailscale">,
 ): OpenClawConfig {
+  // 如果没有覆盖，直接返回原配置（性能优化）
   if (!overrides.auth && !overrides.tailscale) {
     return config;
   }
+  
+  // 使用扩展运算符深度合并配置
+  // 注意：这里只合并 gateway.auth 和 gateway.tailscale，其他配置保持不变
   return {
     ...config,
     gateway: {
       ...config.gateway,
+      // 合并 auth 配置（用户覆盖优先）
       auth: mergeGatewayAuthConfig(config.gateway?.auth, overrides.auth),
+      // 合并 tailscale 配置（用户覆盖优先）
       tailscale: mergeGatewayTailscaleConfig(config.gateway?.tailscale, overrides.tailscale),
     },
   };
 }
 
+/**
+ * 断言有效的网关启动配置快照
+ * 
+ * 在启动流程早期验证配置有效性，如果无效则抛出详细错误信息，
+ * 包含修复提示（运行 doctor 命令）。
+ * 
+ * **防御性编程**: 在关键操作前验证输入，尽早失败以避免后续复杂错误
+ * 
+ * @param snapshot - 配置文件快照
+ * @param options - 可选参数，控制是否包含 doctor 提示
+ * 
+ * @throws Error 当配置无效时抛出，包含详细的错误信息和修复建议
+ * 
+ * @example
+ * // 正常情况：直接返回
+ * assertValidGatewayStartupConfigSnapshot(validSnapshot);
+ * 
+ * // 异常情况：抛出错误
+ * // Error: Invalid config at ~/.openclaw/config.json.
+ * // - gateway.port must be a number between 1 and 65535
+ * // - agents.list is required
+ * // Run "openclaw doctor" to repair, then retry.
+ */
 function assertValidGatewayStartupConfigSnapshot(
   snapshot: ConfigFileSnapshot,
   options: { includeDoctorHint?: boolean } = {},
 ): void {
+  // 如果配置有效，直接返回（守卫模式）
   if (snapshot.valid) {
     return;
   }
+  
+  // 格式化配置问题列表
   const issues =
     snapshot.issues.length > 0
       ? formatConfigIssueLines(snapshot.issues, "", { normalizeRoot: true }).join("\n")
       : "Unknown validation issue.";
+  
+  // 根据选项决定是否添加 doctor 命令提示
   const doctorHint = options.includeDoctorHint
     ? `\nRun "${formatCliCommand("openclaw doctor")}" to repair, then retry.`
     : "";
+  
+  // 抛出包含完整上下文的错误
   throw new Error(`Invalid config at ${snapshot.path}.\n${issues}${doctorHint}`);
 }
 
+/**
+ * 准备网关启动配置
+ * 
+ * 这是网关启动的核心配置处理函数，负责：
+ * 1. 验证配置快照有效性
+ * 2. 执行启动前检查（secret 引用解析）
+ * 3. 确保认证引导配置
+ * 4. 激活运行时 secrets
+ * 
+ * **异步流程控制**: 使用多阶段配置处理确保每个步骤都可回滚
+ * 
+ * @param params - 参数对象
+ * @param params.configSnapshot - 配置文件快照
+ * @param params.runtimeConfig - 运行时配置（已应用环境变量覆盖）
+ * @param params.authOverride - 可选的认证覆盖
+ * @param params.tailscaleOverride - 可选的 Tailscale 覆盖
+ * @param params.activateRuntimeSecrets - 激活运行时 secrets 的函数
+ * 
+ * @returns 完整的认证引导配置和激活后的运行时配置
+ * 
+ * @example
+ * // 使用示例
+ * const startupConfig = await prepareGatewayStartupConfig({
+ *   configSnapshot: snapshot,
+ *   runtimeConfig: runtimeCfg,
+ *   activateRuntimeSecrets: async (config, opts) => {
+ *     if (opts.activate) {
+ *       await activateSecretsRuntimeSnapshot(config);
+ *     }
+ *     return { config };
+ *   }
+ * });
+ * 
+ * // startupConfig.cfg 包含最终可用于启动的配置
+ */
 async function prepareGatewayStartupConfig(params: {
   configSnapshot: ConfigFileSnapshot;
   // Keep startup auth/runtime behavior aligned with loadConfig(), which applies
@@ -270,9 +436,11 @@ async function prepareGatewayStartupConfig(params: {
     options: { reason: "startup"; activate: boolean },
   ) => Promise<{ config: OpenClawConfig }>;
 }): Promise<Awaited<ReturnType<typeof ensureGatewayStartupAuth>>> {
+  // 步骤 1: 验证配置快照（失败则立即抛出）
   assertValidGatewayStartupConfigSnapshot(params.configSnapshot);
 
-  // Fail fast before startup auth persists anything if required refs are unresolved.
+  // 步骤 2: 启动前检查 - 在不激活 secrets 的情况下验证引用
+  // 目的：在持久化任何东西之前快速失败
   const startupPreflightConfig = applyGatewayAuthOverridesForStartupPreflight(
     params.runtimeConfig,
     {
@@ -280,28 +448,37 @@ async function prepareGatewayStartupConfig(params: {
       tailscale: params.tailscaleOverride,
     },
   );
+  
+  // 预检查：不激活 secrets，只验证引用是否存在
   await params.activateRuntimeSecrets(startupPreflightConfig, {
     reason: "startup",
-    activate: false,
+    activate: false,  // 仅验证，不激活
   });
 
+  // 步骤 3: 确保认证引导配置（可能需要生成默认 token/password）
   const authBootstrap = await ensureGatewayStartupAuth({
     cfg: params.runtimeConfig,
     env: process.env,
     authOverride: params.authOverride,
     tailscaleOverride: params.tailscaleOverride,
-    persist: true,
+    persist: true,  // 持久化生成的认证凭据
   });
+  
+  // 步骤 4: 应用认证覆盖到运行时启动配置
   const runtimeStartupConfig = applyGatewayAuthOverridesForStartupPreflight(authBootstrap.cfg, {
     auth: params.authOverride,
     tailscale: params.tailscaleOverride,
   });
+  
+  // 步骤 5: 激活运行时 secrets（真正加载到内存）
   const activatedConfig = (
     await params.activateRuntimeSecrets(runtimeStartupConfig, {
       reason: "startup",
-      activate: true,
+      activate: true,  // 真正激活
     })
   ).config;
+  
+  // 返回完整的启动配置（包含认证引导信息和激活后的配置）
   return {
     ...authBootstrap,
     cfg: activatedConfig,

@@ -1,3 +1,43 @@
+/**
+ * @fileoverview 子代理注册表
+ * 
+ * 本文件实现了子代理 (Subagent) 的注册、管理和生命周期控制。
+ * 
+ * **核心概念**:
+ * - **子代理**: 由主 Agent 孵化出的独立 Agent 实例，用于并行处理任务
+ * - **Session Key**: 格式为 `agent:{agentId}:main|subagent:{sessionId}`
+ * - **父子关系**: 子代理有 controllerSessionKey 指向父代理
+ * - **深度限制**: 防止无限嵌套 (DEFAULT_SUBAGENT_MAX_SPAWN_DEPTH)
+ * - **Workspace 继承**: 子代理自动继承父代理的工作空间
+ * 
+ * **主要功能**:
+ * - 注册/注销子代理运行记录
+ * - 跟踪子代理状态 (running, ended, killed)
+ * - 管理子代理完成通知 (announce flow)
+ * - 处理子代理清理 (cleanup: delete vs keep)
+ * - 持久化到磁盘防止丢失
+ * - 触发 subagent_ended Hook
+ * 
+ * **数据结构**:
+ * ```typescript
+ * type SubagentRunRecord = {
+ *   runId: string;                    // 运行 ID
+ *   childSessionKey: string;          // 子代理 session key
+ *   controllerSessionKey?: string;    // 父代理 session key
+ *   requesterSessionKey: string;      // 请求者 session key
+ *   task: string;                     // 任务描述
+ *   cleanup: "delete" | "keep";       // 完成后是否删除
+ *   createdAt: number;                // 创建时间戳
+ *   startedAt?: number;               // 开始时间戳
+ *   endedAt?: number;                 // 结束时间戳
+ *   outcome?: SubagentRunOutcome;     // 执行结果
+ *   frozenResultText?: string | null; // 冻结的完成结果
+ * }
+ * ```
+ * 
+ * @module agents/subagent-registry
+ */
+
 import { loadConfig } from "../config/config.js";
 import { ensureContextEnginesInitialized } from "../context-engine/init.js";
 import { resolveContextEngine } from "../context-engine/registry.js";

@@ -1,50 +1,417 @@
+/**
+ * @fileoverview 网关配置类型定义
+ * 
+ * 本文件定义了 OpenClaw Gateway 的所有配置类型，包括：
+ * - 网络绑定配置 (bind, TLS)
+ * - 服务发现配置 (mDNS, Wide Area)
+ * - Control UI 配置
+ * - Canvas/Talk 等扩展功能配置
+ * - Tailscale 暴露配置
+ * - 认证配置
+ * - HTTP 端点配置 (Chat Completions, Responses API)
+ * - 推送通知配置 (APNs)
+ * - 节点和工具访问控制
+ * 
+ * **设计原则**:
+ * - 所有字段都是可选的 (`?`)，通过默认值填充保证运行时完整性
+ * - 使用 `SecretInput` 包装敏感字段，支持多种密钥来源（明文、环境变量、密钥管理器）
+ * - 支持渐进式配置，最小配置即可启动
+ * 
+ * **使用示例**:
+ * ```json
+ * {
+ *   "gateway": {
+ *     "port": 18789,
+ *     "bind": "loopback",
+ *     "tls": { "enabled": true, "autoGenerate": true },
+ *     "auth": { "mode": "token", "token": { "source": "env", "id": "GATEWAY_TOKEN" } }
+ *   }
+ * }
+ * ```
+ * 
+ * @module config/types.gateway
+ */
+
 import type { SecretInput } from "./types.secrets.js";
 
+/**
+ * 网关绑定模式类型
+ * 
+ * 控制 Gateway WebSocket/HTTP 服务器的网络绑定策略，决定哪些网络接口可以访问网关服务。
+ * 
+ * **各模式详解**:
+ * - `"auto"`: 自动选择（优先 loopback 127.0.0.1，失败则回退到 0.0.0.0）
+ * - `"lan"`: 绑定到 `0.0.0.0`（所有网络接口，局域网可访问）
+ * - `"loopback"`: 仅绑定到 `127.0.0.1`（最安全，仅本地访问）
+ * - `"custom"`: 使用 `customBindHost` 指定的自定义 IP 地址
+ * - `"tailnet"`: 仅绑定到 Tailscale IPv4 地址 (100.64.0.0/10 网段)
+ * 
+ * **安全建议**:
+ * - 开发环境：使用 `"loopback"` 或 `"auto"`
+ * - 生产环境：配合反向代理使用 `"loopback"`，或直接使用 `"tailnet"` 进行安全远程访问
+ * - 避免在生产环境直接使用 `"lan"`，除非有额外的网络安全措施
+ * 
+ * @example
+ * // 在 config.json 中使用：
+ * {
+ *   "gateway": {
+ *     "bind": "loopback"  // 仅本地访问，最安全
+ *   }
+ * }
+ * 
+ * @example
+ * // 使用 Tailscale 进行安全远程访问：
+ * {
+ *   "gateway": {
+ *     "bind": "tailnet",
+ *     "tailscale": { "mode": "serve" }
+ *   }
+ * }
+ */
 export type GatewayBindMode = "auto" | "lan" | "loopback" | "custom" | "tailnet";
 
+/**
+ * TLS 配置接口
+ * 
+ * 为 Gateway 启用 HTTPS/WSS 加密连接，保护传输数据安全。
+ * 支持自签名证书自动生成或指定现有证书文件。
+ * 
+ * **工作原理**:
+ * 1. 当 `enabled: true` 时，Gateway 会尝试加载证书
+ * 2. 如果 `autoGenerate: true` 且证书不存在，自动生成自签名证书
+ * 3. 如果指定了 `certPath` 和 `keyPath`，使用提供的证书
+ * 4. `caPath` 用于 mTLS（双向认证）或自定义根证书验证
+ * 
+ * **证书管理建议**:
+ * - 开发环境：使用 `autoGenerate: true` 快速启动
+ * - 生产环境：使用正式的 CA 证书（Let's Encrypt 等）
+ * - 内部部署：可考虑自建 CA 签发证书
+ * 
+ * @example
+ * // 开发环境：自动生成证书
+ * const tlsConfig: GatewayTlsConfig = {
+ *   enabled: true,
+ *   autoGenerate: true,
+ * };
+ * 
+ * @example
+ * // 生产环境：使用正式证书
+ * const tlsConfig: GatewayTlsConfig = {
+ *   enabled: true,
+ *   autoGenerate: false,
+ *   certPath: "/etc/ssl/openclaw.crt",
+ *   keyPath: "/etc/ssl/openclaw.key",
+ * };
+ * 
+ * @example
+ * // mTLS 配置（双向认证）
+ * const tlsConfig: GatewayTlsConfig = {
+ *   enabled: true,
+ *   certPath: "/etc/ssl/server.crt",
+ *   keyPath: "/etc/ssl/server.key",
+ *   caPath: "/etc/ssl/ca-bundle.crt",  // 验证客户端证书
+ * };
+ */
 export type GatewayTlsConfig = {
-  /** Enable TLS for the gateway server. */
+  /** 是否启用 TLS 加密（默认：false） */
   enabled?: boolean;
-  /** Auto-generate a self-signed cert if cert/key are missing (default: true). */
+  
+  /** 
+   * 当缺少证书时是否自动生成自签名证书（默认：true）
+   * 
+   * 注意：自签名证书会导致浏览器/客户端显示安全警告，
+   * 仅适用于开发环境或内部测试。
+   */
   autoGenerate?: boolean;
-  /** PEM certificate path for the gateway server. */
+  
+  /** 
+   * PEM 格式证书路径
+   * 
+   * 与 `autoGenerate` 互斥，如果同时指定，优先使用此证书。
+   * 证书必须是 PEM 格式，可以包含完整的证书链。
+   */
   certPath?: string;
-  /** PEM private key path for the gateway server. */
+  
+  /** 
+   * PEM 格式私钥路径
+   * 
+   * 必须与 `certPath` 配对使用。
+   * 私钥不应有密码保护，或需在启动时提供密码。
+   */
   keyPath?: string;
-  /** Optional PEM CA bundle for TLS clients (mTLS or custom roots). */
+  
+  /** 
+   * 可选的 PEM CA 证书包
+   * 
+   * 用途：
+   * - mTLS（双向认证）：验证客户端证书
+   * - 自定义根证书：信任内部 CA 签发的证书
+   * 
+   * 可以包含多个 CA 证书，按顺序验证。
+   */
   caPath?: string;
 };
 
+/**
+ * 广域发现配置
+ * 
+ * 配置基于 DNS-SD（DNS Service Discovery，RFC 6763）的服务发现机制，
+ * 允许在局域网或广域网内自动发现 Gateway 实例。
+ * 
+ * **工作原理**:
+ * 1. Gateway 启动时在指定域名注册 SRV 记录
+ * 2. 客户端通过 DNS 查询 `_openclaw._tcp.<domain>` 发现服务
+ * 3. 返回服务器地址和端口，客户端自动连接
+ * 
+ * **适用场景**:
+ * - 企业内网多网关部署
+ * - 动态 IP 环境（如 DHCP）
+ * - 容器化部署（Kubernetes、Docker Swarm）
+ * 
+ * **DNS 记录示例**:
+ * ```
+ * _openclaw._tcp.openclaw.internal.  SRV  0 5 18789  gateway-host.openclaw.internal.
+ * gateway-host.openclaw.internal.    A    192.168.1.100
+ * ```
+ * 
+ * @example
+ * // 配置示例：
+ * {
+ *   "gateway": {
+ *     "discovery": {
+ *       "wideArea": {
+ *         "enabled": true,
+ *         "domain": "openclaw.internal"
+ *       }
+ *     }
+ *   }
+ * }
+ */
 export type WideAreaDiscoveryConfig = {
+  /** 是否启用广域发现（默认：false） */
   enabled?: boolean;
-  /** Optional unicast DNS-SD domain (e.g. "openclaw.internal"). */
+  
+  /** 
+   * 可选的单播 DNS-SD 域名
+   * 
+   * 示例值：
+   * - `"openclaw.internal"` - 内部域名
+   * - `"openclaw.example.com"` - 公共域名
+   * 
+   * 如果不指定，可能使用本地域名或系统默认域名。
+   */
   domain?: string;
 };
 
+/**
+ * mDNS 发现模式类型
+ * 
+ * 控制 Bonjour/mDNS（Multicast DNS，RFC 6762）广播行为，
+ * 用于零配置网络服务发现。
+ * 
+ * **模式对比**:
+ * 
+ * | 模式 | TXT 记录内容 | 带宽占用 | 隐私性 | 适用场景 |
+ * |------|-------------|---------|--------|----------|
+ * | `off` | 无广播 | 无 | 最高 | 安全敏感环境 |
+ * | `minimal` | 基本信息（名称、端口） | 低 | 较高 | 默认推荐 |
+ * | `full` | 完整信息（含 CLI 路径、SSH 端口） | 中 | 较低 | 开发调试 |
+ * 
+ * **技术细节**:
+ * - mDNS 使用组播地址 `224.0.0.251` (IPv4) 或 `ff02::fb` (IPv6)
+ * - 服务类型：`_openclaw._tcp.local`
+ * - 广播间隔：通常 1 秒，稳定后降低频率
+ * 
+ * **安全考虑**:
+ * - `full` 模式会暴露更多系统信息，不建议在公共网络使用
+ * - 可以通过防火墙规则限制 mDNS 流量
+ */
 export type MdnsDiscoveryMode = "off" | "minimal" | "full";
 
+/**
+ * mDNS 发现配置
+ * 
+ * 配置本地网络的 Bonjour/mDNS 服务发现行为。
+ * 
+ * **工作特点**:
+ * - 无需配置服务器，自动发现同一局域网内的服务
+ * - 适用于家庭网络、小型办公室等环境
+ * - macOS、iOS、Linux（Avahi）原生支持
+ * - Windows 需要安装 Bonjour 打印服务或其他兼容软件
+ * 
+ * @example
+ * // 配置示例：
+ * {
+ *   "gateway": {
+ *     "discovery": {
+ *       "mdns": {
+ *         "mode": "full"  // 广播所有服务信息，方便调试
+ *       }
+ *     }
+ *   }
+ * }
+ * 
+ * @example
+ * // 安全环境配置：
+ * {
+ *   "gateway": {
+ *     "discovery": {
+ *       "mdns": {
+ *         "mode": "minimal"  // 仅广播必要信息
+ *       }
+ *     }
+ *   }
+ * }
+ */
 export type MdnsDiscoveryConfig = {
-  /**
-   * mDNS/Bonjour discovery broadcast mode (default: minimal).
-   * - off: disable mDNS entirely
-   * - minimal: omit cliPath/sshPort from TXT records
-   * - full: include cliPath/sshPort in TXT records
+  /** 
+   * mDNS/Bonjour 广播模式（默认：minimal）
+   * 
+   * 选择合适的模式平衡便利性和安全性。
    */
   mode?: MdnsDiscoveryMode;
 };
 
+/**
+ * 服务发现配置
+ * 
+ * 组合广域发现（DNS-SD）和本地发现（mDNS）配置，
+ * 允许同时启用多种发现机制以适应不同网络环境。
+ * 
+ * **发现策略建议**:
+ * 
+ * | 场景 | 推荐配置 |
+ * |------|---------|
+ * | 单机开发 | 禁用所有发现 |
+ * | 家庭网络 | 仅启用 mDNS (`minimal` 模式) |
+ * | 企业内网 | 同时启用 mDNS + WideArea |
+ * | 云端部署 | 仅启用 WideArea，配合服务网格 |
+ * | 混合云 | 根据网络分区灵活配置 |
+ * 
+ * **故障排查**:
+ * - 使用 `dns-sd -B _openclaw._tcp` (macOS) 或 `avahi-browse -a` (Linux) 测试发现
+ * - 检查防火墙是否放行 UDP 5353 (mDNS) 端口
+ * - 确认路由器是否支持组播转发
+ * 
+ * @example
+ * // 完整配置示例：
+ * {
+ *   "gateway": {
+ *     "discovery": {
+ *       "wideArea": {
+ *         "enabled": true,
+ *         "domain": "openclaw.internal"
+ *       },
+ *       "mdns": {
+ *         "mode": "minimal"
+ *       }
+ *     }
+ *   }
+ * }
+ */
 export type DiscoveryConfig = {
+  /** 广域 DNS-SD 配置，适用于跨子网、跨路由器的服务发现 */
   wideArea?: WideAreaDiscoveryConfig;
+  
+  /** mDNS 配置，适用于同一局域网内的零配置发现 */
   mdns?: MdnsDiscoveryConfig;
 };
 
+/**
+ * Canvas 主机配置
+ * 
+ * Canvas 是 OpenClaw 的实时协作画布功能（A2UI - Agent-to-User Interface），
+ * 需要独立的 HTTP 服务器来托管前端静态资源和 WebSocket 服务。
+ * 
+ * **功能特性**:
+ * - 托管 Canvas 前端应用（HTML/CSS/JS）
+ * - 提供 WebSocket 实时更新通道
+ * - 支持多人协作编辑
+ * - 集成 AI 助手可视化界面
+ * 
+ * **架构说明**:
+ * ```
+ * ┌─────────────┐     HTTP/WebSocket     ┌──────────────┐
+ * │   Browser   │ ◄──────────────────►   │ Canvas Host  │
+ * └─────────────┘                        │  (port 18793)│
+ *                                        └──────────────┘
+ *                                               │
+ *                                               │ 内部通信
+ *                                               ▼
+ *                                        ┌──────────────┐
+ *                                        │   Gateway    │
+ *                                        └──────────────┘
+ * ```
+ * 
+ * **性能优化**:
+ * - 启用 `liveReload` 可在开发时自动刷新浏览器
+ * - 生产环境建议关闭 `liveReload` 减少资源占用
+ * - 可以使用 CDN 或反向代理缓存静态资源
+ * 
+ * @example
+ * // 开发环境配置：
+ * {
+ *   "canvasHost": {
+ *     "enabled": true,
+ *     "port": 18793,
+ *     "root": "~/.openclaw/workspace/canvas",
+ *     "liveReload": true  // 开发模式很有用
+ *   }
+ * }
+ * 
+ * @example
+ * // 生产环境配置：
+ * {
+ *   "canvasHost": {
+ *     "enabled": true,
+ *     "port": 18793,
+ *     "root": "/var/www/openclaw/canvas",
+ *     "liveReload": false  // 关闭以节省资源
+ *   }
+ * }
+ */
 export type CanvasHostConfig = {
+  /** 是否启用 Canvas 主机服务（默认：false） */
   enabled?: boolean;
-  /** Directory to serve (default: ~/.openclaw/workspace/canvas). */
+  
+  /** 
+   * 要服务的静态资源目录
+   * 
+   * 默认值：`~/.openclaw/workspace/canvas`
+   * 
+   * 目录结构示例：
+   * ```
+   * canvas/
+   * ├── index.html
+   * ├── assets/
+   * │   ├── main.js
+   * │   └── style.css
+   * └── manifest.json
+   * ```
+   */
   root?: string;
-  /** HTTP port to listen on (default: 18793). */
+  
+  /** 
+   * HTTP 监听端口
+   * 
+   * 默认值：18793
+   * 
+   * 注意：确保端口未被占用，并在防火墙中开放（如需远程访问）。
+   */
   port?: number;
-  /** Enable live-reload file watching + WS reloads (default: true). */
+  
+  /** 
+   * 是否启用实时重载
+   * 
+   * 功能：
+   * - 监听文件系统变化
+   * - 通过 WebSocket 通知浏览器刷新
+   * - 开发调试非常有用
+   * 
+   * 默认值：true
+   * 
+   * 生产环境建议：false（减少资源占用和安全风险）
+   */
   liveReload?: boolean;
 };
 
