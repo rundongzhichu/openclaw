@@ -250,6 +250,27 @@ export class ConfigRuntimeRefreshError extends Error {
   }
 }
 
+/**
+ * 计算配置原始内容的 SHA-256 哈希值
+ * 
+ * **用途**:
+ * - 配置文件完整性校验
+ * - 检测配置变更
+ * - 缓存失效判断
+ * 
+ * @param raw - 配置文件的原始字符串内容（null 表示文件不存在）
+ * @returns 16 进制哈希字符串
+ * 
+ * @example
+ * ```typescript
+ * const hash = hashConfigRaw('{"gateway": {"port": 18789}}');
+ * console.log(hash);  // → "a1b2c3d4..."
+ * 
+ * // 空配置哈希
+ * const emptyHash = hashConfigRaw(null);
+ * console.log(emptyHash);  // → "e3b0c44..." (SHA-256 of "")
+ * ```
+ */
 function hashConfigRaw(raw: string | null): string {
   return crypto
     .createHash("sha256")
@@ -257,6 +278,44 @@ function hashConfigRaw(raw: string | null): string {
     .digest("hex");
 }
 
+/**
+ * 收紧状态目录权限（仅限 Unix 系统）
+ * 
+ * **安全加固逻辑**:
+ * ```text
+ * 1. 检查平台（跳过 Windows）
+ * 2. 解析状态目录路径
+ * 3. 检查配置目录是否与状态目录一致
+ * 4. 获取当前权限模式
+ * 5. 如果其他用户有访问权限（mode & 0o077 !== 0），则设置为 0o700
+ * ```
+ * 
+ * **权限说明**:
+ * - `0o700`: 仅所有者可读写执行（rwx------）
+ * - `0o077`: 组用户和其他用户的权限掩码
+ * 
+ * **设计目的**:
+ * - 防止其他用户读取敏感配置（如 Token、密钥）
+ * - 符合最小权限原则
+ * - 仅在配置目录与状态目录一致时处理
+ * 
+ * @param params - 参数对象
+ * @param params.configPath - 配置文件路径
+ * @param params.env - 环境变量对象
+ * @param params.homedir - 获取家目录的函数
+ * @param params.fsModule - fs 模块引用
+ * 
+ * @example
+ * ```typescript
+ * await tightenStateDirPermissionsIfNeeded({
+ *   configPath: '/Users/alice/.openclaw/state/config.json',
+ *   env: process.env,
+ *   homedir: os.homedir,
+ *   fsModule: fs
+ * });
+ * // → 如果目录权限是 0o755，则修改为 0o700
+ * ```
+ */
 async function tightenStateDirPermissionsIfNeeded(params: {
   configPath: string;
   env: NodeJS.ProcessEnv;
@@ -614,6 +673,46 @@ function collectEnvRefPaths(value: unknown, path: string, output: Map<string, st
   }
 }
 
+/**
+ * 收集配置对象变更的路径
+ * 
+ * **核心功能**:
+ * - 深度对比两个配置对象的差异
+ * - 记录所有变更的路径（包括嵌套路径）
+ * - 支持数组和对象混合结构
+ * 
+ * **对比逻辑**:
+ * ```text
+ * 1. 如果 base 或 target 不是对象 → 直接比较
+ * 2. 如果都是对象 → 递归对比每个键
+ * 3. 如果是数组 → 逐个元素对比
+ * 4. 记录所有变更的路径到 output Set
+ * ```
+ * 
+ * @param base - 基准配置对象
+ * @param target - 目标配置对象
+ * @param path - 当前路径（用于构建嵌套路径）
+ * @param output - 变更路径集合（输出参数）
+ * 
+ * @example
+ * ```typescript
+ * const base = { gateway: { port: 18789 } };
+ * const target = { gateway: { port: 19001 } };
+ * const changes = new Set<string>();
+ * 
+ * collectChangedPaths(base, target, '', changes);
+ * console.log(changes);  
+ * // → Set { 'gateway.port' }
+ * 
+ * // 嵌套对象变更
+ * const base2 = { a: { b: { c: 1 } } };
+ * const target2 = { a: { b: { c: 2, d: 3 } } };
+ * const changes2 = new Set<string>();
+ * 
+ * collectChangedPaths(base2, target2, '', changes2);
+ * // → Set { 'a.b.c', 'a.b.d' }
+ * ```
+ */
 function collectChangedPaths(
   base: unknown,
   target: unknown,

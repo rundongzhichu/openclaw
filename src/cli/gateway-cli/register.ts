@@ -26,6 +26,96 @@ import {
 } from "./discover.js";
 import { addGatewayRunCommand } from "./run.js";
 
+/**
+ * @fileoverview 网关 CLI 命令注册与实现
+ * 
+ * 本文件实现了 OpenClaw 网关 CLI 命令的注册逻辑，提供了完整的网关运行、状态检查、发现、调用等功能：
+ * 
+ * **核心功能**:
+ * - 网关命令运行器（带错误处理和运行时管理）
+ * - 天数选项解析（支持数字和字符串输入）
+ * - Gateway RPC 选项继承（token/password 从父级继承）
+ * - 成本使用统计报告（按天汇总、最新日展示）
+ * - 网关命令注册（run/status/discover/call/health/cost-usage）
+ * - mDNS 信标发现（本地网络网关自动发现）
+ * - 广域 DNS 发现（widearea DNS 解析）
+ * - 健康度检查（通道健康状态、WebSocket 可达性）
+ * 
+ * **网关命令列表**（6 个主要命令）:
+ * 1. **gateway run** - 前台运行网关
+ *    - 启动 WebSocket 服务器
+ *    - 绑定端口和主机
+ *    - 加载插件和通道
+ * 
+ * 2. **gateway status** - 显示网关状态
+ *    - 服务运行状态
+ *    - 端口占用情况
+ *    - TLS 证书状态
+ * 
+ * 3. **gateway discover** - 发现网关节点
+ *    - mDNS 本地发现
+ *    - 广域 DNS 发现
+ *    - 信标去重和选择
+ * 
+ * 4. **gateway call** - 调用网关 RPC
+ *    - 直接调用网关方法
+ *    - 传递参数和选项
+ *    - 获取返回结果
+ * 
+ * 5. **gateway health** - 健康度检查
+ *    - 通道健康状态
+ *    - WebSocket 连接测试
+ *    - 认证验证
+ * 
+ * 6. **gateway cost-usage** - 成本使用统计
+ *    - 按天汇总成本
+ *    - Token 消耗统计
+ *    - 缺失数据处理
+ * 
+ * **使用示例**:
+ * ```typescript
+ * // 场景 1: 注册网关 CLI
+ * const program = new Command();
+ * registerGatewayCli(program);
+ * await program.parseAsync(process.argv);
+ * 
+ * // 场景 2: 运行网关命令（带错误处理）
+ * runGatewayCommand(async () => {
+ *   await startGatewayServer({ port: 18789 });
+ * }, '启动网关失败');
+ * 
+ * // 场景 3: 解析天数选项
+ * const days = parseDaysOption('30', 7);  // 30
+ * const days = parseDaysOption(15, 7);    // 15
+ * const days = parseDaysOption(null, 7);  // 7 (回退到默认值)
+ * 
+ * // 场景 4: 继承 RPC 选项
+ * const opts = resolveGatewayRpcOptions(
+ *   { token: 'my-token' },
+ *   parentCommand
+ * );
+ * // → { token: 'my-token', password: undefined }
+ * 
+ * // 场景 5: 渲染成本使用统计
+ * const summary: CostUsageSummary = { ... };
+ * const lines = renderCostUsageSummary(summary, 30, true);
+ * console.log(lines.join('\n'));
+ * /*
+ * Usage cost (30 days)
+ * Total: $12.34 · 50000 tokens
+ * Latest day: 2024-01-15 · $0.45 · 2000 tokens
+ * *\/
+ * 
+ * // 场景 6: 发现网关节点
+ * const beacons = await discoverGatewayBeacons({ timeoutMs: 3000 });
+ * const deduped = dedupeBeacons(beacons);
+ * const selected = pickBeaconHost(deduped);
+ * console.log(`发现网关：${selected}`);
+ * ```
+ * 
+ * @module cli/gateway-cli/register
+ */
+
 function runGatewayCommand(action: () => Promise<void>, label?: string) {
   return runCommandWithRuntime(defaultRuntime, action, (err) => {
     const message = String(err);

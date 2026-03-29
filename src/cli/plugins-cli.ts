@@ -37,6 +37,106 @@ import { runPluginInstallCommand } from "./plugins-install-command.js";
 import { runPluginUpdateCommand } from "./plugins-update-command.js";
 import { promptYesNo } from "./prompt.js";
 
+/**
+ * @fileoverview CLI 插件管理命令实现
+ * 
+ * 本文件实现了 OpenClaw 系统的插件管理 CLI 命令，提供了完整的插件生命周期管理能力：
+ * 
+ * **核心功能**:
+ * - `plugins list` - 列出已安装插件（支持 JSON 输出、过滤启用状态）
+ * - `plugins inspect` - 检查插件详细信息（支持所有插件批量检查）
+ * - `plugins install` - 安装新插件（支持 ClawHub 规范、本地路径、NPM 包）
+ * - `plugins update` - 更新插件（支持单个/全部更新、干运行模式）
+ * - `plugins uninstall` - 卸载插件（支持保留文件/配置选项）
+ * - `plugins marketplace` - 列出市场可用插件
+ * - `plugins status` - 显示插件运行状态和兼容性报告
+ * 
+ * **插件来源类型**（4 种）:
+ * 1. **ClawHub 市场插件**: `@openclaw/whatsapp`, `@openclaw/telegram`
+ *    - 通过 ClawHub 注册表发现和安装
+ *    - 支持版本管理和自动更新
+ * 
+ * 2. **本地路径插件**: `./extensions/my-plugin`, `/opt/openclaw/plugins/custom`
+ *    - 直接引用本地目录
+ *    - 适合开发和自定义插件
+ * 
+ * 3. **NPM 包插件**: `npm:@myorg/my-plugin@1.0.0`
+ *    - 从 NPM 仓库安装
+ *    - 支持私有仓库和 scoped packages
+ * 
+ * 4. **Git 仓库插件**: `git+https://github.com/user/repo.git`
+ *    - 从 Git 仓库直接安装
+ *    - 支持特定分支和 tag
+ * 
+ * **插件安装流程**:
+ * ```text
+ * 1. 解析插件规范（ClawHub/NPM/本地路径/Git）
+ * 2. 检查兼容性和依赖关系
+ * 3. 下载/克隆插件代码
+ * 4. 安装插件依赖（pnpm/npm install）
+ * 5. 构建插件（如需要编译）
+ * 6. 注册到配置文件（plugins.installs）
+ * 7. 启用插件（plugins.enabled 列表）
+ * 8. 生成安装报告和日志
+ * ```
+ * 
+ * **插件卸载流程**:
+ * ```text
+ * 1. 解析插件 ID（支持名称/spec/resolvedSpec 匹配）
+ * 2. 检查依赖此插件的通道配置
+ * 3. 提示确认（除非 --force）
+ * 4. 从配置中移除（可选保留配置）
+ * 5. 删除插件目录（可选保留文件）
+ * 6. 清理运行时缓存
+ * 7. 生成卸载报告
+ * ```
+ * 
+ * **安全特性**:
+ * - 安装前验证插件元数据（manifest.json）
+ * - 检查插件签名和来源可信度
+ * - 依赖隔离安装（避免冲突）
+ * - 配置备份（卸载前自动备份）
+ * - 干运行模式（--dry-run 预览变更）
+ * - 权限检查（写保护目录处理）
+ * 
+ * **使用示例**:
+ * ```typescript
+ * // 场景 1: 列出已安装插件
+ * await runPluginsList({ json: false, enabled: true });
+ * // → 表格形式显示启用的插件
+ * 
+ * // 场景 2: 检查插件详情
+ * await runPluginInspect({ pluginId: 'whatsapp', json: true });
+ * // → 输出插件元数据 JSON
+ * 
+ * // 场景 3: 安装 ClawHub 插件
+ * await runPluginInstall('@openclaw/telegram');
+ * // → 从 ClawHub 下载并安装
+ * 
+ * // 场景 4: 安装本地插件
+ * await runPluginInstall('./extensions/my-custom-plugin');
+ * // → 链接本地开发插件
+ * 
+ * // 场景 5: 更新所有插件（干运行）
+ * await runPluginUpdate({ all: true, dryRun: true });
+ * // → 预览可更新的插件列表，不实际更新
+ * 
+ * // 场景 6: 卸载插件（保留配置）
+ * await runPluginUninstall('whatsapp', { keepConfig: true, force: true });
+ * // → 删除插件但保留配置引用
+ * 
+ * // 场景 7: 查看市场插件
+ * await runMarketplaceList({ json: false });
+ * // → 表格显示可用插件及版本
+ * 
+ * // 场景 8: 检查插件兼容性
+ * const report = buildPluginCompatibilityNotices(installedPlugins);
+ * console.log(report.warnings);  // 兼容性警告
+ * ```
+ * 
+ * @module cli/plugins-cli
+ */
+
 export type PluginsListOptions = {
   json?: boolean;
   enabled?: boolean;

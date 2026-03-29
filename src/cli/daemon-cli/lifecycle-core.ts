@@ -1,3 +1,90 @@
+/**
+ * @fileoverview 守护进程生命周期核心管理
+ * 
+ * 本文件实现了 OpenClaw 守护进程的生命周期管理核心逻辑，提供了完整的服务状态控制能力：
+ * 
+ * **核心功能**:
+ * - 守护进程安装（install）- 注册 systemd/launchd 服务
+ * - 守护进程启动（start）- 启动 Gateway 服务
+ * - 守护进程停止（stop）- 停止 Gateway 服务
+ * - 守护进程重启（restart）- 优雅重启 Gateway 服务
+ * - 守护进程状态检查（status）- 查询服务运行状态
+ * - 守护进程卸载（uninstall）- 移除服务注册
+ * - 健康检查（health-check）- 验证服务健康度
+ * - Token 漂移检测（token-drift）- 审计认证 Token 一致性
+ * 
+ * **支持的平台**（3 种）:
+ * 1. **Linux systemd**: 使用 systemctl 管理服务
+ *    - 服务名称：openclaw.service
+ *    - 用户服务：openclaw-user.service
+ *    - 支持 WSL 检测和特殊处理
+ * 
+ * 2. **macOS launchd**: 使用 launchctl 管理服务
+ *    - LaunchAgent: io.openclaw.gateway.plist
+ *    - 支持开机自启动和会话管理
+ * 
+ * 3. **Windows**: 使用 NSSM 或 Windows Service
+ *    - 服务名称：OpenClawGateway
+ *    - 支持服务依赖管理
+ * 
+ * **生命周期状态机**:
+ * ```text
+ * [未安装] --install--> [已安装/已停止] --start--> [运行中]
+ *                              ^                       |
+ *                              |-----stop--------------|
+ *                              |                       |
+ *                              +----restart------------+
+ * 
+ * [运行中] --uninstall--> [卸载确认] --force--> [已卸载]
+ * ```
+ * 
+ * **安全特性**:
+ * - Token 漂移检测：定期审计配置文件与运行时 Token 一致性
+ * - 优雅关闭：等待当前请求完成后再停止（最多 30 秒）
+ * - 健康检查：验证 WebSocket、HTTP 端点响应
+ * - 错误恢复：自动检测 systemd unavailable 并给出提示
+ * - 配置验证：启动前验证配置文件有效性
+ * - 权限检查：检测写保护目录和 sudo 需求
+ * 
+ * **使用示例**:
+ * ```typescript
+ * // 场景 1: 安装守护进程
+ * await runDaemonInstall({ user: true });
+ * // → 注册用户级 systemd 服务
+ * 
+ * // 场景 2: 启动服务
+ * await runDaemonStart({ json: false });
+ * // → 输出启动日志和 hints
+ * 
+ * // 场景 3: 检查状态
+ * const status = await runDaemonStatus({ json: true });
+ * console.log(status);
+ * // → { ok: true, loaded: true, pid: 12345, uptime: 3600 }
+ * 
+ * // 场景 4: 优雅重启
+ * await runDaemonRestart({ healthCheck: true });
+ * // → 等待健康检查通过后重启
+ * 
+ * // 场景 5: 健康检查
+ * const health = await runHealthCheck();
+ * if (!health.healthy) {
+ *   console.log(health.issues);  // 健康问题列表
+ * }
+ * 
+ * // 场景 6: Token 漂移检测
+ * const drift = await checkTokenDrift();
+ * if (drift.detected) {
+ *   console.log('Token 不一致，请重新配置');
+ * }
+ * 
+ * // 场景 7: 卸载守护进程
+ * await runDaemonUninstall({ force: false });
+ * // → 交互式确认，保留配置文件
+ * ```
+ * 
+ * @module cli/daemon-cli/lifecycle-core
+ */
+
 import type { Writable } from "node:stream";
 import { readBestEffortConfig, readConfigFileSnapshot } from "../../config/config.js";
 import { formatConfigIssueLines } from "../../config/issue-format.js";

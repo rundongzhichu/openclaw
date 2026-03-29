@@ -1,3 +1,121 @@
+/**
+ * @fileoverview 守护进程状态收集与诊断
+ * 
+ * 本文件实现了 OpenClaw 守护进程的状态收集与诊断逻辑，提供了完整的服务健康检查能力：
+ * 
+ * **核心功能**:
+ * - 配置文件状态收集（CLI 配置 vs Daemon 配置对比）
+ * - Gateway 运行时状态探测（端口、绑定主机、探测 URL）
+ * - 端口使用情况检查（占用检测、监听器信息）
+ * - TLS 证书加载与验证
+ * - 重启健康度评估（重启历史、失败记录）
+ * - 额外服务检测（多实例冲突）
+ * - Token 漂移审计（配置 Token vs 运行时 Token）
+ * - 网络发现与显示优化（IPv4/IPv6、bind host 解析）
+ * 
+ * **状态收集流程**（8 步）:
+ * ```text
+ * 1. 创建配置 I/O 实例
+ *    └─ createConfigIO()
+ * 
+ * 2. 读取 CLI 和 Daemon 配置文件
+ *    ├─ resolveConfigPath('cli')
+ *    └─ resolveConfigPath('daemon')
+ * 
+ * 3. 验证配置有效性
+ *    └─ validateConfigObjectWithPlugins()
+ * 
+ * 4. 解析 Gateway 端口和绑定主机
+ *    ├─ resolveGatewayPort()
+ *    └─ resolveBestEffortGatewayBindHostForDisplay()
+ * 
+ * 5. 探测 Gateway 运行状态
+ *    └─ probeGatewayStatus()
+ *       ├─ HTTP GET /health
+ *       ├─ WebSocket 连接测试
+ *       └─ 认证 Token 验证
+ * 
+ * 6. 检查端口使用情况
+ *    └─ inspectPortUsage(port)
+ *       ├─ lsof -i :<port>
+ *       └─ netstat -an | grep <port>
+ * 
+ * 7. 加载 TLS 运行时
+ *    └─ loadGatewayTlsRuntime()
+ *       ├─ 读取证书文件
+ *       └─ 验证有效期
+ * 
+ * 8. 审计服务配置
+ *    └─ auditGatewayServiceConfig()
+ *       ├─ 检查 Token 一致性
+ *       ├─ 检测多实例冲突
+ *       └─ 分析重启历史
+ * ```
+ * 
+ * **配置对比逻辑**:
+ * ```typescript
+ * // CLI 配置 vs Daemon 配置
+ * if (cliConfig.gateway.port !== daemonConfig.gateway.port) {
+ *   context.configMismatch = true;
+ *   hints.push('CLI 和 Daemon 配置端口不一致');
+ * }
+ * 
+ * // Token 漂移检测
+ * if (configToken !== runtimeToken) {
+ *   audit.tokenDrift = {
+ *     configValue: configToken,
+ *     runtimeValue: runtimeToken,
+ *     detected: true
+ *   };
+ * }
+ * ```
+ * 
+ * **端口状态分类**（4 种）:
+ * 1. **FREE**: 端口空闲，可绑定
+ * 2. **LISTENING**: 已有进程监听
+ * 3. **TIME_WAIT**: 刚释放，处于等待状态
+ * 4. **UNAVAILABLE**: 系统保留或被防火墙阻止
+ * 
+ * **使用示例**:
+ * ```typescript
+ * // 场景 1: 收集完整状态
+ * const status = await gatherDaemonStatus({ json: false });
+ * console.log(status.service.loaded);      // true/false
+ * console.log(status.gateway?.port);       // 18789
+ * console.log(status.port.status);         // 'LISTENING'
+ * 
+ * // 场景 2: 检查配置一致性
+ * if (status.configMismatch) {
+ *   console.log('⚠️ CLI 和 Daemon 配置不一致');
+ *   console.log(`CLI port: ${status.cliPort}`);
+ *   console.log(`Daemon port: ${status.daemonPort}`);
+ * }
+ * 
+ * // 场景 3: Token 漂移检测
+ * if (status.audit?.tokenDrift?.detected) {
+ *   console.log('⚠️ Token 不一致:');
+ *   console.log(`  配置值：${status.audit.tokenDrift.configValue}`);
+ *   console.log(`  运行值：${status.audit.tokenDrift.runtimeValue}`);
+ * }
+ * 
+ * // 场景 4: 端口占用诊断
+ * if (status.port.status === 'LISTENING') {
+ *   console.log(`端口 ${status.port.port} 被占用:`);
+ *   for (const listener of status.port.listeners) {
+ *     console.log(`  PID ${listener.pid}: ${listener.command}`);
+ *   }
+ * }
+ * 
+ * // 场景 5: TLS 证书检查
+ * if (status.tls?.enabled && !status.tls.valid) {
+ *   console.log('TLS 证书无效:');
+ *   console.log(status.tls.errors);
+ * }
+ * ```
+ * 
+ * @module cli/daemon-cli/status.gather
+ */
+
 import {
   createConfigIO,
   resolveConfigPath,

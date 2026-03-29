@@ -32,6 +32,170 @@ import {
   resolvePortListeningAddresses,
 } from "./status.gather.js";
 
+/**
+ * @fileoverview 守护进程状态打印与格式化
+ * 
+ * 本文件实现了 OpenClaw 守护进程状态的 CLI 打印与格式化逻辑，提供了友好的用户界面输出能力：
+ * 
+ * **核心功能**:
+ * - 服务状态打印（加载状态、命令、工作目录、环境变量）
+ * - RPC 连接信息显示（WebSocket URL、认证状态）
+ * - Gateway 运行时状态（端口、绑定主机、TLS 状态）
+ * - 配置审计报告（Token 漂移、多实例冲突、遗留问题）
+ * - 端口诊断信息（占用情况、监听地址）
+ * - Control UI 链接生成（HTTP/WebSocket 入口）
+ * - systemd/launchd 服务提示（不可用检测、WSL 特殊处理）
+ * - JSON 输出模式（机器可读、脱敏处理）
+ * 
+ * **输出模式**（2 种）:
+ * 1. **人类可读模式** (json=false):
+ *    - 使用彩色终端样式（rich/label/accent/infoText）
+ *    - 结构化分组显示（Service、RPC、Gateway、Port 等）
+ *    - 包含 hints 和修复建议
+ * 
+ * 2. **JSON 模式** (json=true):
+ *    - 机器可读的完整数据结构
+ *    - 自动脱敏敏感环境变量（过滤 Token、密钥）
+ *    - 保持字段顺序和完整性
+ * 
+ * **打印流程**（8 步）:
+ * ```text
+ * 1. 检查输出模式
+ *    ├─ json=true → 调用 sanitizeDaemonStatusForJson()
+ *    └─ json=false → 继续以下步骤
+ * 
+ * 2. 创建终端样式
+ *    └─ createCliStatusTextStyles()
+ *       ├─ rich: 富文本样式
+ *       ├─ label: 标签样式（粗体）
+ *       ├─ accent: 强调色
+ *       ├─ infoText: 信息文本
+ *       ├─ okText: 成功状态（绿色）
+ *       ├─ warnText: 警告状态（黄色）
+ *       └─ errorText: 错误状态（红色）
+ * 
+ * 3. 打印服务基本信息
+ *    ├─ Service: <label> (loaded/not-loaded)
+ *    ├─ File logs: <日志路径>
+ *    ├─ Command: <启动命令>
+ *    ├─ Service file: <服务配置文件路径>
+ *    ├─ Working dir: <工作目录>
+ *    └─ Service env: <环境变量列表>
+ * 
+ * 4. 打印配置审计报告
+ *    ├─ 检查 configAudit.issues
+ *    ├─ 打印验证失败消息
+ *    └─ 提供修复命令建议
+ * 
+ * 5. 打印 RPC 连接信息
+ *    ├─ WebSocket URL
+ *    ├─ 认证模式（token/pairing）
+ *    └─ 连接状态（connected/disconnected）
+ * 
+ * 6. 打印 Gateway 运行时状态
+ *    ├─ 端口和绑定主机
+ *    ├─ TLS 启用状态
+ *    ├─ 探测 URL
+ *    └─ 网络类型（IPv4/IPv6）
+ * 
+ * 7. 打印端口诊断
+ *    ├─ 端口占用状态（FREE/LISTENING/TIME_WAIT）
+ *    ├─ 监听器列表（PID、命令）
+ *    └─ 冲突检测和提示
+ * 
+ * 8. 生成 Control UI 链接
+ *    ├─ HTTP 入口（http://localhost:18789）
+ *    ├─ WebSocket 入口（ws://localhost:18789）
+ *    └─ 根据 TLS 状态选择协议
+ * ```
+ * 
+ * **环境变量脱敏规则**:
+ * ```typescript
+ * // 保留的安全变量
+ * const SAFE_ENV_KEYS = ['NODE_ENV', 'PATH', 'HOME', 'USER'];
+ * 
+ * // 过滤的敏感变量
+ * const SENSITIVE_ENV_KEYS = [
+ *   'OPENCLAW_GATEWAY_TOKEN',
+ *   'OPENCLAW_AUTH_TOKEN',
+ *   'SECRET',
+ *   'PASSWORD',
+ *   'API_KEY'
+ * ];
+ * 
+ * // 脱敏逻辑
+ * function filterDaemonEnv(env) {
+ *   return Object.fromEntries(
+ *     Object.entries(env).filter(([key]) => 
+ *       !SENSITIVE_ENV_KEYS.some(sensitive => 
+ *         key.toUpperCase().includes(sensitive)
+ *       )
+ *     )
+ *   );
+ * }
+ * ```
+ * 
+ * **systemd 不可用处理**:
+ * ```typescript
+ * // 检测 systemd 不可用的详细原因
+ * const detail = await classifySystemdUnavailableDetail();
+ * 
+ * // 根据原因生成不同的提示
+ * if (detail === 'wsl_without_systemd_shim') {
+ *   hints.push('WSL 环境需要安装 systemd-shim');
+ *   hints.push('参考：https://github.com/DamionGiles/ubuntu-wsl2-systemd-script');
+ * }
+ * 
+ * if (detail === 'docker_container') {
+ *   hints.push('容器环境中 systemd 不可用是正常的');
+ *   hints.push('建议使用 docker-compose 或 Kubernetes 管理');
+ * }
+ * ```
+ * 
+ * **使用示例**:
+ * ```typescript
+ * // 场景 1: 人类可读模式
+ * printDaemonStatus(status, { json: false });
+ * // → 输出彩色格式的状态信息
+ * // Service: openclaw-user.service (✓ loaded)
+ * // File logs: ~/.openclaw/state/logs/gateway.log
+ * // Command: node /opt/openclaw/gateway.js --port 18789
+ * // Gateway: http://localhost:18789 (TLS disabled)
+ * // Port 18789: LISTENING (PID 12345)
+ * 
+ * // 场景 2: JSON 模式（脱敏）
+ * printDaemonStatus(status, { json: true });
+ * // → 输出 JSON 数据（敏感环境变量已过滤）
+ * // {
+ * //   "service": {
+ * //     "loaded": true,
+ * //     "command": {
+ * //       "programArguments": ["node", "gateway.js"],
+ * //       "environment": { "NODE_ENV": "production" }  // 敏感变量已移除
+ * //     }
+ * //   }
+ * // }
+ * 
+ * // 场景 3: 检测到配置问题
+ * if (status.service.configAudit?.issues.length > 0) {
+ *   defaultRuntime.error('⚠️ Service config looks out of date');
+ *   for (const issue of status.service.configAudit.issues) {
+ *     defaultRuntime.error(`  - ${issue.message}`);
+ *   }
+ *   // → 输出修复建议
+ *   // Fix with: openclaw config set gateway.port 18789
+ * }
+ * 
+ * // 场景 4: systemd 不可用
+ * if (!status.service.loaded && isSystemdUnavailableDetail(detail)) {
+ *   renderSystemdUnavailableHints({ wsl: true, kind: detail });
+ *   // → 输出 WSL 特殊处理提示
+ * }
+ * ```
+ * 
+ * @module cli/daemon-cli/status.print
+ */
+
 function sanitizeDaemonStatusForJson(status: DaemonStatus): DaemonStatus {
   const command = status.service.command;
   if (!command?.environment) {
