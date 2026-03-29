@@ -540,15 +540,170 @@ export type GatewayServerOptions = {
   ) => Promise<void>;
 };
 
+/**
+ * 启动网关服务器 ⭐⭐⭐ 核心入口函数
+ * 
+ * **核心功能**:
+ * 启动 OpenClaw Gateway 服务器，完成所有初始化流程并返回运行中的服务器实例。
+ * 
+ * **完整启动流程**（20+ 个关键步骤）:
+ * ```text
+ * 阶段 1: 环境初始化与配置加载
+ * 1.1 设置环境变量 (OPENCLAW_GATEWAY_PORT, OPENCLAW_RAW_STREAM)
+ * 1.2 读取配置快照并处理遗留迁移
+ * 1.3 验证配置有效性
+ * 1.4 自动启用插件（applyPluginAutoEnable）
+ * 
+ * 阶段 2: 密钥系统激活
+ * 2.1 创建密钥激活锁（runWithSecretsActivationLock）
+ * 2.2 准备密钥运行时快照（prepareSecretsRuntimeSnapshot）
+ * 2.3 激活密钥并记录诊断日志
+ * 2.4 处理降级和恢复场景（SECRETS_RELOADER_DEGRADED/RECOVERED）
+ * 
+ * 阶段 3: 认证引导
+ * 3.1 应用配置覆盖（applyConfigOverrides）
+ * 3.2 准备网关启动认证（prepareGatewayStartupConfig）
+ * 3.3 自动生成 Token（如果缺失）
+ * 3.4 启用诊断心跳（如果开启）
+ * 3.5 设置 SIGUSR1 重启策略
+ * 
+ * 阶段 4: 启动时迁移与检查
+ * 4.1 播种 Control UI 允许来源（maybeSeedControlUiAllowedOriginsAtStartup）
+ * 4.2 运行矩阵迁移（runStartupMatrixMigration）
+ * 4.3 检测 Matrix 插件安装路径问题
+ * 
+ * 阶段 5: 插件系统初始化
+ * 5.1 初始化子代理注册表（initSubagentRegistry）
+ * 5.2 应用插件自动启用
+ * 5.3 解析默认 Agent ID 和工作区目录
+ * 5.4 延迟配置的 Channel 插件 ID
+ * 5.5 加载网关启动插件（loadGatewayStartupPlugins）
+ * 5.6 创建 Channel 日志和运行时环境
+ * 
+ * 阶段 6: 运行时配置解析
+ * 6.1 解析网关运行时配置（resolveGatewayRuntimeConfig）
+ * 6.2 提取绑定主机、端口、认证、TLS 等配置
+ * 6.3 解析 Hook 客户端 IP 配置
+ * 6.4 加载 TLS 运行时（loadGatewayTlsRuntime）
+ * 
+ * 阶段 7: 速率限制器创建
+ * 7.1 创建认证速率限制器（createGatewayAuthRateLimiters）
+ * 7.2 创建浏览器专用限制器（防止暴力破解）
+ * 
+ * 阶段 8: Control UI 状态解析
+ * 8.1 检查自定义根路径覆盖
+ * 8.2 确保 UI 资源已构建
+ * 8.3 解析 UI 根路径状态（bundled/resolved/missing/invalid）
+ * 
+ * 阶段 9: Wizard 会话跟踪
+ * 9.1 创建 Wizard 会话跟踪器
+ * 9.2 查找运行中的 Wizard
+ * 9.3 清理过期 Wizard 会话
+ * 
+ * 阶段 10: Channel 管理器创建
+ * 10.1 创建 Channel 管理器（createChannelManager）
+ * 10.2 注入配置加载器和日志系统
+ * 10.3 创建就绪检查器（createReadinessChecker）
+ * 
+ * 阶段 11: 网关运行时状态创建
+ * 11.1 创建 HTTP 服务器和 WebSocket 服务器
+ * 11.2 初始化广播系统
+ * 11.3 设置聊天运行状态管理
+ * 11.4 创建工具事件接收者列表
+ * 
+ * 阶段 12: 节点注册表初始化
+ * 12.1 创建节点注册表（NodeRegistry）
+ * 12.2 设置设备管理和连接跟踪
+ * 
+ * 阶段 13: 执行审批管理器
+ * 13.1 创建执行审批管理器（ExecApprovalManager）
+ * 13.2 设置审批转发器
+ * 
+ * 阶段 14: 模型定价缓存刷新
+ * 14.1 启动模型定价缓存刷新（startGatewayModelPricingRefresh）
+ * 
+ * 阶段 15: 通道健康监控
+ * 15.1 启动通道健康监控器（startChannelHealthMonitor）
+ * 
+ * 阶段 16: 网关发现服务
+ * 16.1 启动网关发现（startGatewayDiscovery）
+ * 16.2 远程技能缓存预热
+ * 16.3 刷新远程 bin 文件
+ * 
+ * 阶段 17: 网关侧车服务
+ * 17.1 启动网关侧车（startGatewaySidecars）
+ * 
+ * 阶段 18: Tailscale 网络暴露
+ * 18.1 启动 Tailscale 暴露（startGatewayTailscaleExposure）
+ * 
+ * 阶段 19: WebSocket 处理器附加
+ * 19.1 附加 WebSocket 处理器（attachGatewayWsHandlers）
+ * 19.2 注册所有网关方法
+ * 
+ * 阶段 20: 启动日志与定时任务
+ * 20.1 记录网关启动信息（logGatewayStartup）
+ * 20.2 启动网关维护定时器
+ * 20.3 启动配置重载器
+ * 20.4 启动 Cron 服务
+ * 
+ * 返回：运行中的 Gateway 服务器实例
+ * ```
+ * 
+ * **安全特性**:
+ * - 密钥激活锁：避免并发激活冲突
+ * - 降级模式：密钥失败时保持最后已知良好状态
+ * - 速率限制：防止暴力破解攻击
+ * - TLS 支持：HTTPS/WSS 加密通信
+ * - Tailscale：安全的私有网络暴露
+ * 
+ * **使用示例**:
+ * ```typescript
+ * // 场景 1: 基本启动（默认端口 18789）
+ * const gateway = await startGatewayServer();
+ * console.log(`Gateway running on port 18789`);
+ * 
+ * // 场景 2: 自定义端口和选项
+ * const gateway = await startGatewayServer(18790, {
+ *   host: '0.0.0.0',
+ *   bind: 'localhost',
+ *   controlUiEnabled: true,
+ *   auth: { mode: 'token', token: 'my-secret-token' }
+ * });
+ * 
+ * // 场景 3: 测试最小化网关
+ * process.env.VITEST = '1';
+ * process.env.OPENCLAW_TEST_MINIMAL_GATEWAY = '1';
+ * const gateway = await startGatewayServer(18789, { minimal: true });
+ * ```
+ * 
+ * @param port - 网关监听端口（默认 18789）
+ * @param opts - 网关服务器选项
+ * @param opts.host - 绑定主机地址
+ * @param opts.bind - 绑定接口
+ * @param opts.auth - 认证配置覆盖
+ * @param opts.tailscale - Tailscale 配置覆盖
+ * @param opts.controlUiEnabled - 是否启用 Control UI
+ * @param opts.openAiChatCompletionsEnabled - 是否启用 OpenAI Chat Completions
+ * @param opts.openResponsesEnabled - 是否启用 Open Responses
+ * @param opts.wizardRunner - 自定义 Wizard 运行器
+ * @returns Promise<GatewayServer> 运行中的网关服务器实例
+ */
 export async function startGatewayServer(
+  /** 网关监听端口（默认 18789） */
   port = 18789,
+  /** 网关服务器选项 */
   opts: GatewayServerOptions = {},
 ): Promise<GatewayServer> {
+  // 快速路径：最小化测试网关检测
   const minimalTestGateway =
     process.env.VITEST === "1" && process.env.OPENCLAW_TEST_MINIMAL_GATEWAY === "1";
 
-  // Ensure all default port derivations (browser/canvas) see the actual runtime port.
+  // ========== 阶段 1: 环境初始化 ==========
+  
+  // 确保所有默认端口派生（browser/canvas）看到实际运行时端口
   process.env.OPENCLAW_GATEWAY_PORT = String(port);
+  
+  // 记录接受的环境变量选项
   logAcceptedEnvOption({
     key: "OPENCLAW_RAW_STREAM",
     description: "raw stream logging enabled",
@@ -558,7 +713,11 @@ export async function startGatewayServer(
     description: "raw stream log path override",
   });
 
+  // ========== 阶段 2: 配置加载与迁移 ==========
+  
   let configSnapshot = await readConfigFileSnapshot();
+  
+  // 处理遗留配置迁移
   if (configSnapshot.legacyIssues.length > 0) {
     if (isNixMode) {
       throw new Error(
@@ -582,11 +741,14 @@ export async function startGatewayServer(
     }
   }
 
+  // 重新读取配置快照
   configSnapshot = await readConfigFileSnapshot();
   if (configSnapshot.exists) {
     assertValidGatewayStartupConfigSnapshot(configSnapshot, { includeDoctorHint: true });
   }
 
+  // ========== 阶段 3: 插件自动启用 ==========
+  
   const autoEnable = applyPluginAutoEnable({ config: configSnapshot.config, env: process.env });
   if (autoEnable.changes.length > 0) {
     try {
@@ -603,7 +765,11 @@ export async function startGatewayServer(
     }
   }
 
+  // ========== 阶段 4: 密钥系统激活（带锁机制）==========
+  
   let secretsDegraded = false;
+  
+  // 发送密钥状态事件的辅助函数
   const emitSecretsStateEvent = (
     code: "SECRETS_RELOADER_DEGRADED" | "SECRETS_RELOADER_RECOVERED",
     message: string,
@@ -614,7 +780,11 @@ export async function startGatewayServer(
       contextKey: code,
     });
   };
+  
+  // 密钥激活尾调用 Promise 链
   let secretsActivationTail: Promise<void> = Promise.resolve();
+  
+  // 带锁的密钥激活操作（避免并发冲突）
   const runWithSecretsActivationLock = async <T>(operation: () => Promise<T>): Promise<T> => {
     const run = secretsActivationTail.then(operation, operation);
     secretsActivationTail = run.then(
@@ -623,32 +793,45 @@ export async function startGatewayServer(
     );
     return await run;
   };
+  
+  // 激活运行时密钥的核心函数
   const activateRuntimeSecrets = async (
     config: OpenClawConfig,
     params: { reason: "startup" | "reload" | "restart-check"; activate: boolean },
   ) =>
     await runWithSecretsActivationLock(async () => {
       try {
+        // 准备密钥运行时快照
         const prepared = await prepareSecretsRuntimeSnapshot({ config });
+        
         if (params.activate) {
+          // 激活快照并记录诊断日志
           activateSecretsRuntimeSnapshot(prepared);
           logGatewayAuthSurfaceDiagnostics(prepared);
         }
+        
+        // 记录所有警告
         for (const warning of prepared.warnings) {
           logSecrets.warn(`[${warning.code}] ${warning.message}`);
         }
+        
+        // 处理恢复场景
         if (secretsDegraded) {
           const recoveredMessage =
             "Secret resolution recovered; runtime remained on last-known-good during the outage.";
           logSecrets.info(`[SECRETS_RELOADER_RECOVERED] ${recoveredMessage}`);
           emitSecretsStateEvent("SECRETS_RELOADER_RECOVERED", recoveredMessage, prepared.config);
         }
+        
         secretsDegraded = false;
         return prepared;
       } catch (err) {
         const details = String(err);
+        
+        // 处理降级场景
         if (!secretsDegraded) {
           logSecrets.error(`[SECRETS_RELOADER_DEGRADED] ${details}`);
+          
           if (params.reason !== "startup") {
             emitSecretsStateEvent(
               "SECRETS_RELOADER_DEGRADED",
@@ -659,16 +842,22 @@ export async function startGatewayServer(
         } else {
           logSecrets.warn(`[SECRETS_RELOADER_DEGRADED] ${details}`);
         }
+        
         secretsDegraded = true;
+        
+        // 启动时失败直接抛出异常
         if (params.reason === "startup") {
           throw new Error(`Startup failed: required secrets are unavailable. ${details}`, {
             cause: err,
           });
         }
+        
         throw err;
       }
     });
 
+  // ========== 阶段 5: 认证引导 ==========
+  
   let cfgAtStart: OpenClawConfig;
   const startupRuntimeConfig = applyConfigOverrides(configSnapshot.config);
   const authBootstrap = await prepareGatewayStartupConfig({
@@ -727,6 +916,8 @@ export async function startGatewayServer(
     );
   }
 
+  // ========== 阶段 6: 插件系统初始化 ==========
+  
   initSubagentRegistry();
   const gatewayPluginConfigAtStart = applyPluginAutoEnable({
     config: cfgAtStart,
@@ -766,6 +957,9 @@ export async function startGatewayServer(
   const channelMethods = listChannelPlugins().flatMap((plugin) => plugin.gatewayMethods ?? []);
   const gatewayMethods = Array.from(new Set([...baseGatewayMethods, ...channelMethods]));
   let pluginServices: PluginServicesHandle | null = null;
+
+  // ========== 阶段 7: 运行时配置解析 ==========
+  
   const runtimeConfig = await resolveGatewayRuntimeConfig({
     cfg: cfgAtStart,
     port,
@@ -795,11 +989,15 @@ export async function startGatewayServer(
   let hookClientIpConfig = resolveHookClientIpConfig(cfgAtStart);
   const canvasHostEnabled = runtimeConfig.canvasHostEnabled;
 
+  // ========== 阶段 8: 速率限制器创建 ==========
+  
   // Create auth rate limiters used by connect/auth flows.
   const rateLimitConfig = cfgAtStart.gateway?.auth?.rateLimit;
   const { rateLimiter: authRateLimiter, browserRateLimiter: browserAuthRateLimiter } =
     createGatewayAuthRateLimiters(rateLimitConfig);
 
+  // ========== 阶段 9: Control UI 状态解析 ==========
+  
   let controlUiRootState: ControlUiRootState | undefined;
   if (controlUiRootOverride) {
     const resolvedOverride = resolveControlUiRootOverrideSync(controlUiRootOverride);
@@ -841,9 +1039,13 @@ export async function startGatewayServer(
       : { kind: "missing" };
   }
 
+  // ========== 阶段 10: Wizard 会话跟踪 ==========
+  
   const wizardRunner = opts.wizardRunner ?? runSetupWizard;
   const { wizardSessions, findRunningWizard, purgeWizardSession } = createWizardSessionTracker();
 
+  // ========== 阶段 11: Channel 管理器创建 ==========
+  
   const deps = createDefaultDeps();
   let canvasHostServer: CanvasHostServer | null = null;
   const gatewayTls = await loadGatewayTlsRuntime(cfgAtStart.gateway?.tls, log.child("tls"));
@@ -865,6 +1067,9 @@ export async function startGatewayServer(
     channelManager,
     startedAt: serverStartedAt,
   });
+
+  // ========== 阶段 12: 网关运行时状态创建 ==========
+  
   const {
     canvasHost,
     releasePluginRouteRegistry,

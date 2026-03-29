@@ -2435,25 +2435,118 @@ let runtimeConfigSnapshot: OpenClawConfig | null = null;
 let runtimeConfigSourceSnapshot: OpenClawConfig | null = null;
 let runtimeConfigSnapshotRefreshHandler: RuntimeConfigSnapshotRefreshHandler | null = null;
 
+/**
+ * 解析配置缓存过期时间（毫秒）
+ * 
+ * **环境变量优先级**:
+ * 1. `OPENCLAW_CONFIG_CACHE_MS` - 自定义缓存时间
+ * 2. 默认值 `DEFAULT_CONFIG_CACHE_MS` (200ms)
+ * 
+ * **特殊值处理**:
+ * - 空字符串 `""` → 返回 0（禁用缓存）
+ * - `"0"` → 返回 0（禁用缓存）
+ * - 无效数字 → 返回默认值
+ * - 负数 → 返回 0（通过 Math.max 修正）
+ * 
+ * **使用场景**:
+ * - 测试中禁用缓存（设置为 0）
+ * - 高性能场景延长缓存时间
+ * - 调试时缩短缓存时间
+ * 
+ * @param env - 环境变量对象
+ * @returns 缓存过期时间（毫秒），0 表示禁用缓存
+ * 
+ * @example
+ * ```typescript
+ * // 默认情况
+ * resolveConfigCacheMs(process.env);
+ * // → 200 (DEFAULT_CONFIG_CACHE_MS)
+ * 
+ * // 禁用缓存
+ * resolveConfigCacheMs({ OPENCLAW_CONFIG_CACHE_MS: '0' });
+ * // → 0
+ * 
+ * // 自定义缓存时间（5 秒）
+ * resolveConfigCacheMs({ OPENCLAW_CONFIG_CACHE_MS: '5000' });
+ * // → 5000
+ * 
+ * // 无效值回退到默认
+ * resolveConfigCacheMs({ OPENCLAW_CONFIG_CACHE_MS: 'invalid' });
+ * // → 200
+ * ```
+ */
 function resolveConfigCacheMs(env: NodeJS.ProcessEnv): number {
   const raw = env.OPENCLAW_CONFIG_CACHE_MS?.trim();
+  
+  // 显式禁用缓存（空字符串或 "0"）
   if (raw === "" || raw === "0") {
     return 0;
   }
+  
+  // 未设置时使用默认值
   if (!raw) {
     return DEFAULT_CONFIG_CACHE_MS;
   }
+  
+  // 解析为整数
   const parsed = Number.parseInt(raw, 10);
+  
+  // 无效数字回退到默认值
   if (!Number.isFinite(parsed)) {
     return DEFAULT_CONFIG_CACHE_MS;
   }
+  
+  // 确保非负数
   return Math.max(0, parsed);
 }
 
+/**
+ * 判断是否应该使用配置缓存
+ * 
+ * **判断逻辑**:
+ * ```text
+ * 1. 检查禁用标志
+ *    ├─ OPENCLAW_DISABLE_CONFIG_CACHE 已设置 → 返回 false
+ * 
+ * 2. 检查缓存时间
+ *    ├─ resolveConfigCacheMs(env) > 0 → 返回 true
+ *    └─ 否则 → 返回 false
+ * ```
+ * 
+ * **禁用方式**:
+ * - 设置任意非空值：`OPENCLAW_DISABLE_CONFIG_CACHE=1`
+ * - 设置缓存时间为 0：`OPENCLAW_CONFIG_CACHE_MS=0`
+ * 
+ * **用途**:
+ * - 测试环境中禁用缓存以确保数据新鲜
+ * - 开发调试时强制重新加载配置
+ * - 生产环境启用缓存提升性能
+ * 
+ * @param env - 环境变量对象
+ * @returns boolean - 是否启用缓存
+ * 
+ * @example
+ * ```typescript
+ * // 默认启用（如果有缓存时间）
+ * shouldUseConfigCache(process.env);
+ * // → true/false (取决于 OPENCLAW_CONFIG_CACHE_MS)
+ * 
+ * // 显式禁用
+ * shouldUseConfigCache({ OPENCLAW_DISABLE_CONFIG_CACHE: '1' });
+ * // → false
+ * 
+ * // 缓存时间为 0 也禁用
+ * shouldUseConfigCache({ OPENCLAW_CONFIG_CACHE_MS: '0' });
+ * // → false
+ * ```
+ */
 function shouldUseConfigCache(env: NodeJS.ProcessEnv): boolean {
+  // 检查禁用标志（任何非空值都会禁用）
   if (env.OPENCLAW_DISABLE_CONFIG_CACHE?.trim()) {
     return false;
   }
+  
+  // 检查缓存时间是否大于 0
   return resolveConfigCacheMs(env) > 0;
 }
 
@@ -2484,8 +2577,47 @@ export function getRuntimeConfigSourceSnapshot(): OpenClawConfig | null {
   return runtimeConfigSourceSnapshot;
 }
 
+/**
+ * 检查运行时快照与候选配置的顶层结构兼容性
+ * 
+ * **检查逻辑**:
+ * 1. 遍历运行时快照的所有顶层键
+ * 2. 检查候选配置是否包含相同键
+ * 3. 检查对应值的类型是否一致（包括 array/null/基本类型）
+ * 
+ * **用途**:
+ * - 在投影操作前验证安全性
+ * - 防止将不相关的配置合并到源快照
+ * - 避免意外的字段删除或类型冲突
+ * 
+ * @param params - 检查参数
+ * @param params.runtimeSnapshot - 运行时配置快照
+ * @param params.candidate - 候选配置对象
+ * @returns boolean - 是否兼容
+ * 
+ * @example
+ * ```typescript
+ * // 兼容案例
+ * const runtime = { gateway: { port: 8080 }, tools: {} };
+ * const candidate = { gateway: { port: 9090 }, tools: { browser: true } };
+ * isCompatibleTopLevelRuntimeProjectionShape({ runtimeSnapshot: runtime, candidate });
+ * // → true (键和类型都匹配)
+ * 
+ * // 不兼容案例 - 缺少键
+ * const candidate2 = { gateway: { port: 9090 } };
+ * isCompatibleTopLevelRuntimeProjectionShape({ runtimeSnapshot: runtime, candidate: candidate2 });
+ * // → false (缺少 tools 键)
+ * 
+ * // 不兼容案例 - 类型不匹配
+ * const candidate3 = { gateway: "invalid", tools: {} };
+ * isCompatibleTopLevelRuntimeProjectionShape({ runtimeSnapshot: runtime, candidate: candidate3 });
+ * // → false (gateway 类型从 object 变为 string)
+ * ```
+ */
 function isCompatibleTopLevelRuntimeProjectionShape(params: {
+  /** 运行时配置快照 */
   runtimeSnapshot: OpenClawConfig;
+  /** 候选配置对象 */
   candidate: OpenClawConfig;
 }): boolean {
   const runtime = params.runtimeSnapshot as Record<string, unknown>;

@@ -1,3 +1,59 @@
+/**
+ * @fileoverview CLI 配置管理命令实现
+ * 
+ * 本文件实现了 OpenClaw 系统的配置管理 CLI 命令，提供了完整的配置文件操作能力：
+ * 
+ * **核心功能**:
+ * - `config set` - 设置配置值（支持值模式、引用构建器模式、批量 JSON 模式）
+ * - `config get` - 获取配置值
+ * - `config unset` - 删除配置项
+ * - `config file` - 打印配置文件路径
+ * - `config schema` - 输出配置 JSON Schema
+ * - `config validate` - 验证配置有效性
+ * 
+ * **配置设置模式**（3 种）:
+ * 1. **值模式 (Value Mode)**: 直接设置普通值
+ *    - 示例：`openclaw config set gateway.port 19001 --strict-json`
+ * 
+ * 2. **引用构建器模式 (Ref Builder Mode)**: 创建 SecretRef 引用
+ *    - 示例：`openclaw config set channels.discord.token --ref-provider default --ref-source env --ref-id DISCORD_BOT_TOKEN`
+ *    - 支持三种引用源：
+ *      - `env`: 环境变量引用（如 `${DISCORD_TOKEN}`）
+ *      - `file`: 文件路径引用
+ *      - `exec`: 执行命令引用
+ * 
+ * 3. **批量 JSON 模式 (Batch JSON Mode)**: 批量设置多个配置项
+ *    - 示例：`openclaw config set --batch-file ./config-set.batch.json --dry-run`
+ *    - JSON 格式：`[{ "path": "gateway.port", "value": 19001 }, ...]`
+ * 
+ * **SecretRef 引用系统**:
+ * - **引用格式**: `{ source, provider, id }`
+ * - **Provider 类型**: `env`, `file`, `exec` 等
+ * - **验证规则**:
+ *   - `isValidEnvSecretRefId`: 环境变量 ID 验证（大写字母 + 下划线）
+ *   - `isValidFileSecretRefId`: 文件路径验证
+ *   - `isValidExecSecretRefId`: 执行命令验证
+ *   - `isValidSecretProviderAlias`: Provider 别名验证
+ * 
+ * **安全特性**:
+ * - 原型污染防护（isBlockedObjectKey 检查）
+ * - 配置脱敏显示（redactConfigObject）
+ * - 敏感路径特殊处理（gateway.auth.*）
+ * - 严格的 JSON 解析（JSON5 支持注释和尾随逗号）
+ * - 写入前验证（validateConfigObjectRaw）
+ * - 干运行模式（--dry-run 预览变更）
+ * 
+ * **路径表示法**:
+ * ```typescript
+ * // 点分隔字符串：'gateway.port'
+ * // 路径段数组：['gateway', 'port']
+ * // 嵌套对象：['secrets', 'providers', 'vault', 'url']
+ * // 数组索引：['channels', 'whatsapp', '0', 'token']
+ * ```
+ * 
+ * @module cli/config-cli
+ */
+
 import type { Command } from "commander";
 import JSON5 from "json5";
 import type { OpenClawConfig } from "../config/config.js";
