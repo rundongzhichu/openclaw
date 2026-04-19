@@ -10,6 +10,11 @@ title: "Skills"
 
 OpenClaw uses **[AgentSkills](https://agentskills.io)-compatible** skill folders to teach the agent how to use tools. Each skill is a directory containing a `SKILL.md` with YAML frontmatter and instructions. OpenClaw loads **bundled skills** plus optional local overrides, and filters them at load time based on environment, config, and binary presence.
 
+## Want the internals
+
+For a Mandarin deep dive covering the implementation path from skill discovery
+to agent-run prompt injection, see [Skills Loading Internals](/learning/skills-loading).
+
 ## Locations and precedence
 
 OpenClaw loads skills from these sources:
