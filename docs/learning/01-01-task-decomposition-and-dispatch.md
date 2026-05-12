@@ -179,64 +179,6 @@ Agent 可以通过特定工具主动进行任务分解：
 
 **sessions_spawn 工具**（最核心的拆分机制）：
 
-```typescript
-interface SessionsSpawnParams {
-  task: string;              // 必需：任务描述
-  label?: string;            // 可选：任务标签（用于标识）
-  runtime?: "subagent" | "acp";  // 运行时类型
-  agentId?: string;          // 目标 Agent ID（默认继承当前）
-  model?: string;            // 模型覆盖（如 "anthropic/claude-3-opus"）
-  thinking?: string;         // 思考级别（low/medium/high）
-  runTimeoutSeconds?: number;// 超时时间（秒）
-  thread?: boolean;          // 是否绑定到频道线程
-  mode?: "run" | "session";  // 运行模式（一次性 or 持久会话）
-  cleanup?: "delete" | "keep"; // 清理策略
-  sandbox?: "inherit" | "require"; // 沙箱模式
-  context?: "isolated" | "fork"; // 上下文模式
-  attachments?: Attachment[]; // 附件传递
-}
-```
-
-**使用示例：**
-
-```typescript
-// 简单拆分 - 研究任务
-await sessions_spawn({
-  task: "Research quantum computing trends in 2024",
-  label: "quantum-research",
-  model: "anthropic/claude-3-opus",
-  context: "fork"
-});
-
-// 并行拆分 - 多语言翻译
-const translations = await Promise.all([
-  sessions_spawn({
-    task: "Translate the document to French",
-    agentId: "translator-fr",
-    context: "isolated"
-  }),
-  sessions_spawn({
-    task: "Translate the document to Spanish",
-    agentId: "translator-es",
-    context: "isolated"
-  }),
-  sessions_spawn({
-    task: "Translate the document to German",
-    agentId: "translator-de",
-    context: "isolated"
-  })
-]);
-```
-
-**llm-task 工具**（用于 Lobster 工作流）：
-
-```typescript
-interface LlmTaskParams {
-  prompt: string;            // 任务指令
-  input?: unknown;           // 输入负载
-  schema?: unknown;          // JSON Schema 验证
-  provider?: string;         // Provider 覆盖
-  model?: string;            // Model 覆盖
   thinking?: string;         // 思考级别
   timeoutMs?: number;        // 超时时间
 }
@@ -246,7 +188,7 @@ interface LlmTaskParams {
 
 当上下文长度接近模型限制时，自动触发**上下文压缩**或**任务分段**：
 
-```typescript
+``typescript
 // src/agents/pi-embedded-runner/compact.ts
 async function compactContext(params: CompactParams): Promise<CompactResult> {
   // 1. 保留最近的消息
@@ -268,57 +210,321 @@ async function compactContext(params: CompactParams): Promise<CompactResult> {
 
 ### 3.2 OpenProse 声明式编排
 
-OpenProse 提供了一种声明式的任务编排语言，简化复杂工作流的定义：
+OpenProse 提供了一种声明式的任务编排语言，简化复杂工作流的定义。
 
-```prose
-# 定义专用 Agent
-agent researcher:
-  model: opus
-  prompt: "You are a research expert"
+#### 🎯 核心设计理念：自模拟 VM (Self-Simulating VM)
 
-agent writer:
-  model: sonnet
-  prompt: "You are a technical writer"
+**OpenProse 没有传统的编译器或解析器代码**。它采用创新的"提示词即代码"(Prompt-as-Code)范式：
 
-# 并行执行多个子任务
-parallel:
-  research = session: researcher
-    prompt: "Research quantum computing trends"
-  
-  analysis = session: analyst
-    prompt: "Analyze market data"
-
-# 整合结果
-output report = session: writer
-  prompt: "Synthesize research and analysis"
-  context: { research, analysis }
+```
+用户运行: /prose run example.prose
+    ↓
+OpenClaw 加载 SKILL.md
+    ↓
+AI 读取 prose.md (VM 规范文档)
+    ↓
+AI 成为 VM，逐行解释 .prose 文件
+    ↓
+遇到 "session ..." → 调用 sessions_spawn 工具
+    ↓
+遇到 "parallel:" → 并行调用多个 sessions_spawn
+    ↓
+结果写入 .prose/runs/{id}/bindings/
 ```
 
-**编译后的执行逻辑：**
+**关键特性：**
+- **LLM 即 VM**: AI 模型本身读取 [`prose.md`](file:///Users/sunshoucai/vscodeProjects/openclaw/extensions/open-prose/skills/prose/prose.md) 规范后，"模拟"执行虚拟机
+- **技能驱动**: 通过 [`SKILL.md`](file:///Users/sunshoucai/vscodeProjects/openclaw/extensions/open-prose/skills/prose/SKILL.md) 将 LLM 变成 VM
+- **无传统解析器**: `.prose` 文件不会被编译成 AST 或字节码
+- **Markdown 格式规范**: VM 语义完全由 Markdown 文档定义
 
+#### 📁 核心文件结构
+
+```
+extensions/open-prose/
+├── index.ts                          # 插件入口（仅注册，无实际逻辑）
+└── skills/prose/
+    ├── SKILL.md                      # 技能元数据和命令路由 (15.2KB)
+    ├── prose.md                      # VM 完整语义规范 (35.5KB) ⭐
+    ├── compiler.md                   # 语法规则和验证指南 (80.9KB)
+    ├── help.md                       # 帮助文档和 FAQ
+    ├── examples/                     # 示例程序
+    │   ├── 01-hello-world.prose
+    │   ├── 16-parallel-reviews.prose
+    │   └── ...
+    ├── state/                        # 状态管理后端
+    │   ├── filesystem.md             # 文件系统状态（默认）
+    │   ├── in-context.md             # 上下文状态
+    │   ├── sqlite.md                 # SQLite 后端（实验性）
+    │   └── postgres.md               # PostgreSQL 后端（实验性）
+    └── primitives/
+        └── session.md                # 会话上下文和压缩指南
+```
+
+#### 💡 语法示例与执行映射
+
+**示例 1：基础会话** ([`01-hello-world.prose`](file:///Users/sunshoucai/vscodeProjects/openclaw/extensions/open-prose/skills/prose/examples/01-hello-world.prose))
+
+```prose
+# Hello World - 最简单的 OpenProse 程序
+session "Say hello and briefly introduce yourself"
+```
+
+**执行过程：**
 ```typescript
-// 并行启动所有 session
-const [research, analysis] = await Promise.all([
-  Task({
+// AI 作为 VM 执行时，会调用：
+await sessions_spawn({
+  description: "OpenProse session",
+  prompt: "Say hello and briefly introduce yourself",
+  subagent_type: "general-purpose"
+});
+```
+
+---
+
+**示例 2：多步骤工作流** ([`02-research-and-summarize.prose`](file:///Users/sunshoucai/vscodeProjects/openclaw/extensions/open-prose/skills/prose/examples/02-research-and-summarize.prose))
+
+```prose
+# Research and Summarize
+session "Research the latest developments in AI agents..."
+
+session "Summarize the key findings in 5 bullet points..."
+```
+
+**执行过程：**
+```typescript
+// 顺序执行两个 session
+const research = await sessions_spawn({
+  prompt: "Research the latest developments in AI agents..."
+});
+
+const summary = await sessions_spawn({
+  prompt: "Summarize the key findings...",
+  context: { research }  // 传递前一个结果
+});
+```
+
+---
+
+**示例 3：Agent 定义与并行执行** ([`16-parallel-reviews.prose`](file:///Users/sunshoucai/vscodeProjects/openclaw/extensions/open-prose/skills/prose/examples/16-parallel-reviews.prose))
+
+```prose
+# Parallel Code Reviews
+agent reviewer:
+  model: sonnet
+  prompt: "You are an expert code reviewer"
+
+# 并行执行多个审查
+parallel:
+  security = session: reviewer
+    prompt: "Review for security vulnerabilities"
+  perf = session: reviewer
+    prompt: "Review for performance issues"
+  style = session: reviewer
+    prompt: "Review for code style and readability"
+
+# 整合所有审查结果
+session "Create unified code review report"
+  context: { security, perf, style }
+```
+
+**执行过程：**
+```typescript
+// 1. 注册 Agent 定义
+const agentConfig = {
+  reviewer: {
+    model: "sonnet",
+    prompt: "You are an expert code reviewer"
+  }
+};
+
+// 2. 并行启动所有 session（真正的并发）
+const [security, perf, style] = await Promise.all([
+  sessions_spawn({
     description: "OpenProse session",
-    prompt: "Research quantum computing trends\n\nSystem: You are a research expert",
+    prompt: "Review for security vulnerabilities\n\nSystem: You are an expert code reviewer",
     subagent_type: "general-purpose",
-    model: "opus"
+    model: "sonnet"
   }),
-  Task({
-    description: "OpenProse session",
-    prompt: "Analyze market data",
-    subagent_type: "general-purpose"
+  sessions_spawn({
+    prompt: "Review for performance issues\n\nSystem: You are an expert code reviewer",
+    model: "sonnet"
+  }),
+  sessions_spawn({
+    prompt: "Review for code style and readability\n\nSystem: You are an expert code reviewer",
+    model: "sonnet"
   })
 ]);
 
-// 整合结果
-const report = await Task({
-  description: "OpenProse session",
-  prompt: "Synthesize research and analysis",
-  context: { research, analysis }
+// 3. 整合结果
+await sessions_spawn({
+  prompt: "Create unified code review report",
+  context: { security, perf, style }
 });
 ```
+
+---
+
+#### 🔧 核心语法要素
+
+| 语法 | 说明 | 映射到的工具 |
+|------|------|-------------|
+| `session "prompt"` | 创建一次性会话 | `sessions_spawn` |
+| `resume: agent` | 恢复持久化 Agent | `sessions_spawn` + 加载记忆 |
+| `agent name:` | 定义可复用 Agent | 配置注册 |
+| `parallel:` | 并行执行块 | 多个 `sessions_spawn` 并发 |
+| `let x = session ...` | 绑定变量 | 写入 `.prose/runs/{id}/bindings/x.md` |
+| `context: { a, b }` | 传递上下文 | 从 bindings 读取并注入 prompt |
+| `use "@handle/slug"` | 导入外部程序 | `web_fetch` 获取远程 `.prose` 文件 |
+| `input name:` | 声明输入参数 | 从调用者接收 |
+| `output name = ...` | 声明输出 | 写入 bindings 并返回给调用者 |
+
+---
+
+#### 🗂️ 状态管理机制
+
+OpenProse 支持多种状态后端，默认使用文件系统：
+
+```
+.prose/
+├── .env                              # 环境变量配置
+├── runs/
+│   └── {YYYYMMDD}-{HHMMSS}-{random}/ # 每次执行的唯一 ID
+│       ├── program.prose             # 运行的程序副本
+│       ├── state.md                  # 执行状态追踪（VM 写入）
+│       ├── bindings/                 # 变量绑定存储
+│       │   ├── research.md           # let/research 的结果
+│       │   ├── analysis.md           # let/analysis 的结果
+│       │   └── ...
+│       └── agents/                   # 持久化 Agent 记忆
+│           └── captain/
+│               ├── memory.md         # 当前记忆状态
+│               ├── captain-001.md    # 历史片段
+│               └── captain-002.md
+└── agents/                           # 项目级 Agent 存储
+```
+
+**状态文件职责分离：**
+- `state.md` - **仅 VM 写入**，追踪执行位置、已完成的语句
+- `bindings/{name}.md` - **子 Agent 写入**，保存会话输出
+- `agents/{name}/memory.md` - **持久化 Agent 写入**，维护长期记忆
+
+---
+
+#### 🔄 完整的执行算法
+
+当 AI 作为 OpenProse VM 执行程序时，遵循以下算法：
+
+```typescript
+async function executeProgram(program: ProseProgram): Promise<Outputs> {
+  // Phase 1: 静态收集（编译期）
+  const imports = collectUseStatements(program);      // 收集 use 语句
+  const inputs = bindInputs(program, callerInputs);   // 绑定输入参数
+  const agents = collectAgentDefinitions(program);    // 收集 Agent 定义
+  const blocks = collectBlockDefinitions(program);    // 收集块定义
+  
+  // Phase 2: 动态执行（运行期）
+  for (const statement of program.statements) {
+    switch (statement.type) {
+      case "session":
+        // 调用 sessions_spawn 工具
+        const result = await sessions_spawn({
+          prompt: resolvePrompt(statement, context),
+          model: resolveModel(statement, agents),
+          subagent_type: "general-purpose"
+        });
+        bindResult(statement.name, result);
+        break;
+        
+      case "resume":
+        // 加载 Agent 记忆并恢复
+        const memory = await loadAgentMemory(statement.agent);
+        const resumed = await sessions_spawn({
+          prompt: buildResumePrompt(statement, memory),
+          model: resolveModel(statement, agents)
+        });
+        bindResult(statement.name, resumed);
+        break;
+        
+      case "parallel":
+        // 并行执行所有分支
+        const branches = statement.branches.map(branch =>
+          sessions_spawn({
+            prompt: resolvePrompt(branch, context),
+            model: resolveModel(branch, agents)
+          })
+        );
+        const results = await Promise.all(branches);
+        bindParallelResults(statement.bindings, results);
+        break;
+        
+      case "let":
+      case "const":
+        // 执行右侧表达式并绑定
+        const value = await evaluateRHS(statement.rhs, context);
+        bindVariable(statement.name, value);
+        break;
+        
+      case "loop":
+        // 循环执行直到条件满足
+        while (evaluateCondition(statement.condition)) {
+          await executeBlock(statement.body, context);
+        }
+        break;
+        
+      case "choice":
+      case "if":
+        // 智能评估离散条件
+        const matchedBranch = await evaluateDiscretion(statement.conditions);
+        await executeBlock(matchedBranch.body, context);
+        break;
+        
+      case "do":
+        // 调用命名块
+        await invokeBlock(statement.blockName, statement.args, blocks);
+        break;
+    }
+    
+    // 更新执行状态
+    updateExecutionState(statement.position);
+  }
+  
+  // Phase 3: 收集输出
+  return collectOutputBindings(program.outputs);
+}
+```
+
+---
+
+#### 🎨 设计哲学
+
+**为什么 OpenProse 不使用传统解析器？**
+
+1. **LLM 是模拟器**: 给定足够详细的系统描述，LLM 不仅描述系统，还会**模拟**系统
+2. **模拟即实现**: 当模拟的 VM 产生真实的子 Agent、真实的输出、真实的状态时，"模拟 VM" 和"成为 VM" 的界限消失
+3. **自明性优先**: Markdown 格式的规范比 BNF 语法更易读、更易修改
+4. **智能 IoC**: 传统 IoC 容器从配置文件连线依赖；OpenProse 的容器是 AI 会话，用理解力连线 Agent
+
+**与传统编程语言的对比：**
+
+| 特性 | 传统语言 | OpenProse |
+|------|---------|-----------|
+| 解析器 | Lexer + Parser → AST | LLM 阅读 prose.md 直接理解 |
+| 编译器 | AST → 字节码/机器码 | 无编译，直接解释执行 |
+| 运行时 | VM/JVM/CLR | LLM + OpenClaw 工具集 |
+| 类型系统 | 静态/动态类型检查 | 自然语言理解 |
+| 错误处理 | try-catch-finally | try-catch-retry + 智能判断 |
+| 并发模型 | 线程/协程/Actor | parallel 块 → 并行 Task 调用 |
+
+---
+
+#### 📚 相关资源
+
+- **完整 VM 规范**: [`prose.md`](file:///Users/sunshoucai/vscodeProjects/openclaw/extensions/open-prose/skills/prose/prose.md)
+- **语法规则**: [`compiler.md`](file:///Users/sunshoucai/vscodeProjects/openclaw/extensions/open-prose/skills/prose/compiler.md)
+- **技能入口**: [`SKILL.md`](file:///Users/sunshoucai/vscodeProjects/openclaw/extensions/open-prose/skills/prose/SKILL.md)
+- **示例集合**: [`examples/`](file:///Users/sunshoucai/vscodeProjects/openclaw/extensions/open-prose/skills/prose/examples/)
+- **官方文档**: [`docs/prose.md`](file:///Users/sunshoucai/vscodeProjects/openclaw/docs/prose.md)
 
 ---
 
@@ -439,7 +645,7 @@ const report = await Task({
 │   mode: "run" | "session",           │
 │   note: "..."                        │
 │ }                                    │
-└─────────────────────────────────────┘
+└────────────┬────────────────────────┘
 ```
 
 ### 4.2 核心代码实现
@@ -649,7 +855,7 @@ export async function spawnSubagentDirect(
 
 #### 深度限制防止无限递归
 
-```typescript
+```
 // 计算当前会话的 spawn 深度
 const callerDepth = getSubagentDepthFromSessionStore(requesterSessionKey, { cfg });
 
@@ -678,7 +884,7 @@ Level 0: 主 Agent (agent:main:main)
 
 #### 并发限制防止资源耗尽
 
-```typescript
+```
 // 统计当前活跃的子代理数量
 const activeChildren = countActiveRunsForSession(requesterSessionKey);
 
@@ -725,7 +931,7 @@ Subagent Registry 是整个子代理系统的**中枢神经**，负责管理所�
 
 ### 5.2 子代理运行记录结构
 
-```typescript
+```
 // src/agents/subagent-registry.types.ts
 
 export type SubagentRunRecord = {
@@ -840,7 +1046,7 @@ export function reconcileOrphanedRestoredRuns(): void {
 
 **清理策略：**
 
-```typescript
+``typescript
 // 根据 cleanup 配置决定是否删除会话
 if (run.cleanup === "delete") {
   await callGateway({
@@ -994,7 +1200,7 @@ export async function captureSubagentCompletionReply(
 
 ### 6.3 格式化通知消息
 
-```typescript
+``typescript
 // src/agents/subagent-announce.ts
 
 function buildAnnounceReplyInstruction(params: {
@@ -1019,7 +1225,7 @@ function buildAnnounceReplyInstruction(params: {
 
 ### 6.4 可靠投递与重试
 
-```typescript
+``typescript
 // src/agents/subagent-announce-delivery.ts
 
 export async function runAnnounceDeliveryWithRetry<T>(params: {
@@ -1064,7 +1270,7 @@ export async function runAnnounceDeliveryWithRetry<T>(params: {
 
 为了防止重复通知，系统使用 **idempotency key**：
 
-```typescript
+``typescript
 // src/agents/announce-idempotency.ts
 
 export function buildAnnounceIdempotencyKey(announceId: string): string {
@@ -1093,7 +1299,7 @@ await callGateway({
 
 当子代理等待其子代理（后代）完成时，需要特殊的唤醒机制：
 
-```typescript
+``typescript
 // src/agents/subagent-announce.ts
 
 async function wakeSubagentRunAfterDescendants(params: {
@@ -1154,7 +1360,7 @@ Lane 队列是 OpenClaw 的**并发控制核心**，确保任务有序执行并�
 
 **Lane 类型：**
 
-```typescript
+``typescript
 // src/process/lanes.ts
 
 export enum CommandLane {
@@ -1197,7 +1403,7 @@ export enum CommandLane {
 
 ### 7.2 会话级串行，会话间并行
 
-```typescript
+``typescript
 // src/process/command-queue.ts
 
 class CommandQueueManager {
@@ -1250,7 +1456,7 @@ Lane cron:        [Cron 1 ............] [Cron 2 ..]
 
 子代理支持多种超时机制：
 
-```typescript
+``typescript
 // src/agents/subagent-spawn-plan.ts
 
 export function resolveConfiguredSubagentRunTimeoutSeconds(params: {
@@ -1269,7 +1475,7 @@ export function resolveConfiguredSubagentRunTimeoutSeconds(params: {
 
 **超时处理：**
 
-```typescript
+``typescript
 // src/agents/pi-embedded-runner/run.ts
 
 async function executeWithTimeout(params: {
@@ -1298,7 +1504,7 @@ async function executeWithTimeout(params: {
 
 子代理可以在独立的沙箱环境中运行，提供额外的安全保障：
 
-```typescript
+``typescript
 // src/agents/subagent-spawn.ts
 
 // 沙箱兼容性检查
@@ -1323,7 +1529,7 @@ if (!childRuntime.sandboxed && (requesterRuntime.sandboxed || sandboxMode === "r
 
 **沙箱模式：**
 
-```typescript
+``typescript
 type SandboxMode = 
   | "inherit"   // 继承父会话的沙箱配置
   | "require";  // 强制要求沙箱环境
@@ -1345,7 +1551,7 @@ type SpawnSubagentContextMode =
 
 #### 8.1.1 Isolated 模式（完全隔离）
 
-```typescript
+``typescript
 // 创建全新的空会话
 const childSession = {
   sessionKey: childSessionKey,
@@ -1364,7 +1570,7 @@ const childSession = {
 
 #### 8.1.2 Fork 模式（分叉继承）
 
-```typescript
+``typescript
 // src/agents/subagent-spawn.runtime.ts
 
 async function forkSessionFromParent(params: {
@@ -1456,7 +1662,7 @@ function selectMessagesForFork(
 
 子代理还可以继承父代理的工作空间（文件系统访问权限）：
 
-```typescript
+``typescript
 // src/agents/spawned-context.ts
 
 export function resolveSpawnedWorkspaceInheritance(params: {
@@ -1488,7 +1694,7 @@ export function resolveSpawnedWorkspaceInheritance(params: {
 
 **需求：** 同时研究多个主题并整合结果
 
-```typescript
+``typescript
 // 主 Agent 执行逻辑
 
 // 1. 并行启动三个研究子代理
@@ -1527,7 +1733,7 @@ sendToUser(finalReport);
 
 **需求：** 将文档翻译成多种语言
 
-```typescript
+``typescript
 // 1. 读取源文档
 const sourceDoc = await readFile("document.md");
 
@@ -1555,7 +1761,7 @@ for (let i = 0; i < languages.length; i++) {
 
 **需求：** 对代码库进行全面审查
 
-```typescript
+``typescript
 // 1. 获取代码变更列表
 const changes = await gitDiff();
 
@@ -1593,7 +1799,7 @@ generateReviewReport(consolidatedReview);
 
 **需求：** 处理大规模数据集并生成洞察
 
-```typescript
+``typescript
 // 1. 数据预处理
 const preprocessedData = await sessions_spawn({
   task: "Clean and preprocess the dataset: handle missing values, normalize formats",
@@ -1639,7 +1845,7 @@ generateDashboard(insights.text);
 
 **需求：** 运行全面的测试并汇总结果
 
-```typescript
+``typescript
 // 1. 并行运行不同类型的测试
 const testResults = await Promise.all([
   sessions_spawn({
@@ -1692,7 +1898,7 @@ sendTestReport(summary);
 
 **建议：** 保持 `maxSpawnDepth` 在 2-3 之间
 
-```yaml
+```
 # config.yaml
 agents:
   defaults:
@@ -1709,7 +1915,7 @@ agents:
 
 根据任务难度选择模型：
 
-```typescript
+```
 // 高难度推理任务
 sessions_spawn({
   task: "Complex architectural design",
@@ -1733,7 +1939,7 @@ sessions_spawn({
 
 将不同类型任务分配到不同 Lane：
 
-```typescript
+```
 // 长时间运行的任务使用独立 Lane
 sessions_spawn({
   task: "Generate comprehensive report",
@@ -1755,7 +1961,7 @@ await sessions_spawn({
 
 定期检查 TaskFlow 和 Task Registry：
 
-```bash
+```
 # 查看活跃任务
 openclaw tasks list --status running
 
@@ -1770,7 +1976,7 @@ openclaw subagents list
 
 为关键任务设置合理的重试：
 
-```yaml
+```
 # config.yaml
 agents:
   defaults:
@@ -1782,7 +1988,7 @@ agents:
 
 ### 10.6 及时清理无用会话
 
-```typescript
+```
 // 一次性任务使用 delete 清理
 sessions_spawn({
   task: "Quick calculation",
@@ -1799,7 +2005,7 @@ sessions_spawn({
 
 ### 10.7 使用标签便于追踪
 
-```typescript
+```
 sessions_spawn({
   task: "Research topic",
   label: "research-2024-q1", // 清晰的标签
@@ -1811,7 +2017,7 @@ const runs = listSubagentRuns({ label: "research-2024-q1" });
 
 ### 10.8 附件传递最佳实践
 
-```typescript
+```
 // ✅ 好的做法：明确指定编码和 MIME 类型
 sessions_spawn({
   task: "Analyze this data",
@@ -1840,7 +2046,7 @@ sessions_spawn({
 
 ### 10.9 错误处理与降级
 
-```typescript
+```
 try {
   const result = await sessions_spawn({
     task: "Critical analysis",
