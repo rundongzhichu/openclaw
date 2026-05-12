@@ -236,7 +236,7 @@ async function compactContext(params: CompactParams): Promise<CompactResult> {
 #### 执行流程
 
 ```
-父 Agent 调用 sessions_spawn
+父 Agent 调用 sessions_spawn 工具
     ↓
 验证深度限制（默认 maxDepth=2）
     ↓
